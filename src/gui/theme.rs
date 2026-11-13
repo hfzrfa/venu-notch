@@ -132,7 +132,7 @@ pub fn apply_style(ctx: &egui::Context, pal: Palette) {
     *v = egui::Visuals::dark();
     v.window_fill = pal.popup;
     v.panel_fill = pal.bg;
-    v.window_stroke = Stroke::new(1.0, pal.divider);
+    v.window_stroke = Stroke::new(1.0_f32, pal.divider);
     v.window_rounding = Rounding::same(10.0);
     v.menu_rounding = Rounding::same(10.0);
     v.window_shadow = Shadow {
@@ -147,29 +147,29 @@ pub fn apply_style(ctx: &egui::Context, pal: Palette) {
     v.override_text_color = Some(pal.text_primary);
     v.hyperlink_color = pal.accent;
     v.selection.bg_fill = pal.accent;
-    v.selection.stroke = Stroke::new(1.0, pal.on_accent);
+    v.selection.stroke = Stroke::new(1.0_f32, pal.on_accent);
     v.slider_trailing_fill = true;
 
     v.widgets.noninteractive.bg_fill = pal.surface;
     v.widgets.noninteractive.weak_bg_fill = pal.surface;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal.divider);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, pal.text_secondary);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, pal.divider);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, pal.text_secondary);
     v.widgets.inactive.bg_fill = pal.surface_hover;
     v.widgets.inactive.weak_bg_fill = pal.surface;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.divider);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, pal.text_primary);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, pal.divider);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, pal.text_primary);
     v.widgets.hovered.bg_fill = pal.surface_active;
     v.widgets.hovered.weak_bg_fill = pal.surface_hover;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, pal.accent.gamma_multiply(0.55));
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, pal.text_primary);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, pal.accent.gamma_multiply(0.55));
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, pal.text_primary);
     v.widgets.active.bg_fill = pal.accent;
     v.widgets.active.weak_bg_fill = pal.surface_active;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, pal.accent);
-    v.widgets.active.fg_stroke = Stroke::new(1.0, pal.text_primary);
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, pal.accent);
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, pal.text_primary);
     v.widgets.open.bg_fill = pal.surface_hover;
     v.widgets.open.weak_bg_fill = pal.surface_hover;
-    v.widgets.open.bg_stroke = Stroke::new(1.0, pal.divider);
-    v.widgets.open.fg_stroke = Stroke::new(1.0, pal.text_primary);
+    v.widgets.open.bg_stroke = Stroke::new(1.0_f32, pal.divider);
+    v.widgets.open.fg_stroke = Stroke::new(1.0_f32, pal.text_primary);
 
     for w in [
         &mut v.widgets.noninteractive,

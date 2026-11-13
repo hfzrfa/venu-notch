@@ -582,19 +582,23 @@ impl NotchState {
         }
     }
 
-    /// Advance the carousel by `steps` slides, clamped to the ends.
-    ///
-    /// Deliberately clamped rather than wrapping: hitting a wall tells you
-    /// where you are in the deck, whereas wrapping makes a four-slide carousel
-    /// feel like an infinite scroll.
+    /// Advance the carousel by `steps` slides, wrapping at both ends.
     pub fn step_slide(&mut self, steps: i32, cfg: &AppConfig) {
         let len = cfg.notch.effective_slides().len();
         if len == 0 {
             return;
         }
-        let next = (self.active as i32 + steps).clamp(0, len as i32 - 1) as usize;
+        let raw = self.active as i32 + steps;
+        let next = raw.rem_euclid(len as i32) as usize;
         if next != self.active {
+            let wrapped = raw < 0 || raw >= len as i32;
             self.active = next;
+            // The painter has no duplicate end pages. Snap only across the
+            // seam so the carousel never flies through every intermediate
+            // page; ordinary neighbouring moves keep their spring animation.
+            if wrapped {
+                self.carousel.set(next as f32);
+            }
             self.dirty = true;
             // Changing slides while typing would strand the edit.
             self.cancel_edit();
@@ -771,6 +775,34 @@ mod tests {
         assert!(state.marquee_offset < 0.0);
     }
 
+    #[test]
+    fn explicit_clock_stays_selected_while_media_is_playing() {
+        let mut cfg = AppConfig::default();
+        cfg.notch.default_collapsed = crate::config::CollapsedMode::Clock;
+        let mut state = resting(&cfg, SlideKind::Media, false);
+        state.apply_default_collapsed(&cfg, true, false);
+        assert_eq!(
+            cfg.notch.effective_slides().get(state.active),
+            Some(&SlideKind::Clock)
+        );
+    }
+
+    #[test]
+    fn auto_uses_media_only_when_playing() {
+        let cfg = AppConfig::default();
+        let mut state = resting(&cfg, SlideKind::Clock, false);
+        state.apply_default_collapsed(&cfg, true, false);
+        assert_eq!(
+            cfg.notch.effective_slides().get(state.active),
+            Some(&SlideKind::Media)
+        );
+        state.apply_default_collapsed(&cfg, false, false);
+        assert_eq!(
+            cfg.notch.effective_slides().get(state.active),
+            Some(&SlideKind::Clock)
+        );
+    }
+
     /// The whole per-frame tick, held collapsed, for `seconds`.
     fn tick_for(state: &mut NotchState, cfg: &AppConfig, seconds: f32) {
         let mut left = seconds;
@@ -791,12 +823,12 @@ mod tests {
 
     #[test]
     fn split_segments_grow_in_and_skip_the_middle_face() {
-        let cfg = split_cfg(SlideKind::Clock, SlideKind::Stats);
+        let cfg = split_cfg(SlideKind::Clock, SlideKind::Calendar);
         let mut state = resting(&cfg, SlideKind::Media, false);
         tick_for(&mut state, &cfg, 1.5);
         let (l, r) = state.split_widths();
         assert!((l - layout::segment_width(SlideKind::Clock)).abs() < 0.5);
-        assert!((r - layout::segment_width(SlideKind::Stats)).abs() < 0.5);
+        assert!((r - layout::segment_width(SlideKind::Calendar)).abs() < 0.5);
 
         // Resting on the Clock: the left segment would repeat it, so it goes.
         let clock = cfg
@@ -812,13 +844,13 @@ mod tests {
 
     #[test]
     fn measured_text_sets_the_moving_text_segment() {
-        let cfg = split_cfg(SlideKind::Marquee, SlideKind::Stats);
+        let cfg = split_cfg(SlideKind::Marquee, SlideKind::Calendar);
         let mut state = resting(&cfg, SlideKind::Wallpaper, false);
         state.text_segment_width = layout::text_segment_width(250.0);
         tick_for(&mut state, &cfg, 1.5);
         let (left, right) = state.split_widths();
         assert!((left - layout::text_segment_width(250.0)).abs() < 0.5);
-        assert!((right - layout::segment_width(SlideKind::Stats)).abs() < 0.5);
+        assert!((right - layout::segment_width(SlideKind::Calendar)).abs() < 0.5);
     }
 
     #[test]
@@ -832,7 +864,7 @@ mod tests {
 
     #[test]
     fn marquee_in_a_side_segment_scrolls() {
-        let cfg = split_cfg(SlideKind::Marquee, SlideKind::Stats);
+        let cfg = split_cfg(SlideKind::Marquee, SlideKind::Calendar);
         let mut state = resting(&cfg, SlideKind::Clock, false);
         tick_for(&mut state, &cfg, 1.0);
         let before = state.marquee_offset;
@@ -842,17 +874,17 @@ mod tests {
 
     #[test]
     fn opening_onto_a_segment_restores_the_resting_face() {
-        let cfg = split_cfg(SlideKind::Clock, SlideKind::Stats);
+        let cfg = split_cfg(SlideKind::Clock, SlideKind::Calendar);
         let mut state = resting(&cfg, SlideKind::Media, false);
         let media = state.active;
-        assert!(state.open_onto(&[SlideKind::Stats], &cfg));
+        assert!(state.open_onto(&[SlideKind::Calendar], &cfg));
         assert_ne!(state.active, media);
         assert!(!state.dirty, "a peek is not a choice to persist");
         state.restore_home();
         assert_eq!(state.active, media);
 
         // Scrolling away while open is a real choice: it sticks.
-        assert!(state.open_onto(&[SlideKind::Stats], &cfg));
+        assert!(state.open_onto(&[SlideKind::Calendar], &cfg));
         state.step_slide(-1, &cfg);
         let chosen = state.active;
         state.restore_home();
@@ -860,12 +892,26 @@ mod tests {
     }
 
     #[test]
+    fn carousel_wraps_in_both_directions() {
+        let cfg = AppConfig::default();
+        let len = cfg.notch.effective_slides().len();
+        let mut state = NotchState::new(&cfg);
+        state.active = 0;
+        state.step_slide(-1, &cfg);
+        assert_eq!(state.active, len - 1);
+        assert_eq!(state.carousel.value, (len - 1) as f32);
+        state.step_slide(1, &cfg);
+        assert_eq!(state.active, 0);
+        assert_eq!(state.carousel.value, 0.0);
+    }
+
+    #[test]
     fn opening_onto_a_slide_outside_the_deck_does_nothing() {
-        let mut cfg = split_cfg(SlideKind::Clock, SlideKind::Stats);
-        cfg.notch.slides.retain(|s| *s != SlideKind::Stats);
+        let mut cfg = split_cfg(SlideKind::Clock, SlideKind::Calendar);
+        cfg.notch.slides.retain(|s| *s != SlideKind::Calendar);
         let mut state = resting(&cfg, SlideKind::Media, false);
         let before = state.active;
-        assert!(!state.open_onto(&[SlideKind::Stats], &cfg));
+        assert!(!state.open_onto(&[SlideKind::Calendar], &cfg));
         assert_eq!(state.active, before);
     }
 
@@ -1059,7 +1105,7 @@ mod tests {
     fn a_click_ripple_runs_once_and_the_hover_fades_out() {
         let cfg = AppConfig::default();
         let mut state = NotchState::new(&cfg);
-        let target = Target::round(layout::Hit::Pill(0), (10.0, 10.0, 9.0));
+        let target = Target::round(layout::Hit::Media(0), (10.0, 10.0, 9.0));
 
         state.hot = Some(target);
         tick_for(&mut state, &cfg, 0.2);

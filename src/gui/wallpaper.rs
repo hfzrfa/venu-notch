@@ -167,7 +167,7 @@ pub fn preview(
         // Rule-of-thirds guides, only while dragging, so the preview stays
         // clean at rest but framing has something to snap the eye to.
         if response.dragged() || response.hovered() {
-            let guide = Stroke::new(1.0, Color32::from_white_alpha(38));
+            let guide = Stroke::new(1.0_f32, Color32::from_white_alpha(38));
             for i in 1..3 {
                 let f = i as f32 / 3.0;
                 let x = rect.left() + rect.width() * f;
@@ -195,7 +195,7 @@ pub fn preview(
     painter.rect_stroke(
         rect,
         rounding,
-        Stroke::new(1.0, Color32::from_rgb(48, 48, 56)),
+        Stroke::new(1.0_f32, Color32::from_rgb(48, 48, 56)),
     );
 
     if response.hovered() && src.is_some() {

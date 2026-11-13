@@ -317,20 +317,6 @@ pub fn slide_body(panel: NotchShape) -> D2D_RECT_F {
     }
 }
 
-/// Previous / play-pause / next on the closed pill's right end, when it is
-/// showing Now Playing: centres and radius, left to right.
-pub fn pill_media_buttons(shape: NotchShape) -> [(f32, f32, f32); 3] {
-    let cy = (shape.top + shape.bottom) * 0.5;
-    let r = 8.0;
-    let step = 22.0;
-    let last = shape.right - super::theme::PILL_GUTTER - r;
-    [
-        (last - step * 2.0, cy, r),
-        (last - step, cy, r),
-        (last, cy, r),
-    ]
-}
-
 /// The round + button at the right end of the Status list's heading.
 pub fn status_plus_button(body: D2D_RECT_F) -> (f32, f32, f32) {
     (body.right - 9.0, body.top + 6.0, 9.0)
@@ -347,12 +333,70 @@ pub fn status_list_column(body: D2D_RECT_F) -> crate::notch::layout::Rect {
 /// a shorter one lays art and text out side by side.
 pub const MEDIA_STACKED_MIN_H: f32 = 200.0;
 
+#[derive(Clone, Copy, Debug)]
+pub struct MediaRegions {
+    pub player: D2D_RECT_F,
+    pub lyrics: Option<D2D_RECT_F>,
+}
+
+/// Divide Now Playing into player and lyric regions without assuming one
+/// fixed panel shape. Wide panels split into columns; narrow/tall panels put
+/// lyrics below the player. Painting and hit testing both use this result.
+pub fn media_regions(body: D2D_RECT_F, show_lyrics: bool) -> MediaRegions {
+    if !show_lyrics {
+        return MediaRegions {
+            player: body,
+            lyrics: None,
+        };
+    }
+    let w = body.right - body.left;
+    let h = body.bottom - body.top;
+    if w >= 360.0 && (w >= 520.0 || w / h.max(1.0) >= 2.05) {
+        // Keep enough room beside the artwork for a recognisable title. The
+        // old 41% compact split left only ~55 px for metadata at the common
+        // 420 px panel size, so almost every title collapsed to one word.
+        let player_share = if w >= 680.0 {
+            0.48
+        } else if w >= 520.0 {
+            0.46
+        } else {
+            0.50
+        };
+        let split = body.left + w * player_share;
+        MediaRegions {
+            player: D2D_RECT_F {
+                right: split - 6.0,
+                ..body
+            },
+            lyrics: Some(D2D_RECT_F {
+                left: split + 6.0,
+                ..body
+            }),
+        }
+    } else {
+        let player_h = (h * 0.62).clamp(76.0, (h - 42.0).max(76.0));
+        let split = (body.top + player_h).min(body.bottom - 34.0);
+        MediaRegions {
+            player: D2D_RECT_F {
+                bottom: split - 5.0,
+                ..body
+            },
+            lyrics: Some(D2D_RECT_F {
+                top: split + 5.0,
+                ..body
+            }),
+        }
+    }
+}
+
 /// Previous / play-pause / next centred along the bottom of `area`.
 fn centred_buttons(area: D2D_RECT_F) -> [(f32, f32, f32); 3] {
-    let r = 15.0;
-    let gap = 34.0;
+    let w = (area.right - area.left).max(1.0);
+    let h = (area.bottom - area.top).max(1.0);
+    let r = (w * 0.075).min(h * 0.18).clamp(8.0, 15.0);
+    let gap = (w * 0.22).clamp(r * 2.1, 34.0);
     let cx = (area.left + area.right) * 0.5;
-    let cy = area.bottom - r - 4.0;
+    let cy = area.bottom - r - 3.0;
     [
         (cx - gap, cy, r * 0.72),
         (cx, cy, r),
@@ -379,7 +423,8 @@ pub fn media_art(body: D2D_RECT_F, aspect: f32) -> D2D_RECT_F {
             bottom: body.top + art_h,
         }
     } else {
-        let side = h.min(w * 0.4).max(24.0);
+        let height_cap = if w < 280.0 { (h - 40.0).max(24.0) } else { h };
+        let side = height_cap.min(w * 0.4).max(24.0);
         D2D_RECT_F {
             left: body.left,
             top: body.top,
@@ -408,7 +453,32 @@ pub fn media_text_column(body: D2D_RECT_F) -> D2D_RECT_F {
 /// Shared by the painter and the window for the same draw/hit-test reason as
 /// [`NotchShape::pin_button`].
 pub fn media_transport_buttons(body: D2D_RECT_F) -> [(f32, f32, f32); 3] {
-    centred_buttons(media_text_column(body))
+    let column = media_text_column(body);
+    let area = if column.right - column.left < 112.0 {
+        body
+    } else {
+        column
+    };
+    centred_buttons(area)
+}
+
+/// Generous interactive bounds around the thin Now Playing progress line.
+/// Text timestamps occupy the outer edges, hence the 34px inset.
+pub fn media_timeline_hitbox(body: D2D_RECT_F) -> D2D_RECT_F {
+    let column = media_text_column(body);
+    let [previous, _, _] = media_transport_buttons(body);
+    let inset = if body.bottom - body.top >= MEDIA_STACKED_MIN_H {
+        ((column.right - column.left) * 0.12).min(56.0)
+    } else {
+        0.0
+    };
+    let y = previous.1 - 27.0;
+    D2D_RECT_F {
+        left: column.left + inset + 34.0,
+        top: y - 8.0,
+        right: column.right - inset - 34.0,
+        bottom: y + 8.0,
+    }
 }
 
 /// The focus timer's reset / start-pause / skip buttons.
@@ -593,6 +663,45 @@ mod tests {
         let points = shape.rim_points();
         assert_eq!(points.first(), Some(&(115.0, 0.0)));
         assert_eq!(points.last(), Some(&(285.0, 0.0)));
+    }
+
+    #[test]
+    fn media_regions_reflow_for_wide_and_narrow_panels() {
+        let wide = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: 440.0,
+            bottom: 140.0,
+        };
+        let wide_regions = media_regions(wide, true);
+        let wide_lyrics = wide_regions.lyrics.unwrap();
+        assert!(wide_regions.player.right < wide_lyrics.left);
+        assert_eq!(wide_regions.player.top, wide_lyrics.top);
+
+        let narrow = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: 300.0,
+            bottom: 180.0,
+        };
+        let narrow_regions = media_regions(narrow, true);
+        let narrow_lyrics = narrow_regions.lyrics.unwrap();
+        assert!(narrow_regions.player.bottom < narrow_lyrics.top);
+        assert_eq!(narrow_regions.player.left, narrow_lyrics.left);
+    }
+
+    #[test]
+    fn compact_media_buttons_stay_inside_the_player() {
+        let body = D2D_RECT_F {
+            left: 10.0,
+            top: 5.0,
+            right: 190.0,
+            bottom: 125.0,
+        };
+        for (x, y, r) in media_transport_buttons(body) {
+            assert!(x - r >= body.left && x + r <= body.right);
+            assert!(y - r >= body.top && y + r <= body.bottom);
+        }
     }
 }
 

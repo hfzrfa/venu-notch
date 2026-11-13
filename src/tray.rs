@@ -18,19 +18,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const WM_TRAY_ICON: u32 = WM_USER + 101;
-const WM_VENU_OPEN_SETTINGS: u32 = WM_USER + 102;
+const WM_NOVA_OPEN_SETTINGS: u32 = WM_USER + 102;
 const ID_TRAY_SETTINGS: usize = 2001;
 const ID_TRAY_EXIT: usize = 2002;
 const ID_TRAY_OPEN_NOTCH: usize = 2003;
 const ID_TRAY_CLICK_THROUGH: usize = 2004;
 const ID_TRAY_RESET: usize = 2005;
 
-static TRAY_CLASS_NAME: &str = "VenuTrayClass";
+static TRAY_CLASS_NAME: &str = "NovaTrayClass";
 
 /// Explorer broadcasts this registered message to every top-level window
 /// whenever it (re)starts — after a crash, an `explorer.exe` restart, or
 /// because it simply wasn't up yet when this app registered its icon (the
-/// case when Venu is set to launch at sign-in). Every tray icon on the
+/// case when Nova is set to launch at sign-in). Every tray icon on the
 /// system is gone at that point; the fix is to listen for it and re-add.
 static WM_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -84,9 +84,9 @@ pub struct SystemTray {
 unsafe impl Send for SystemTray {}
 unsafe impl Sync for SystemTray {}
 
-/// The Venu logo from the icon resource `build.rs` embeds in the exe (id 1),
+/// The Nova logo from the icon resource `build.rs` embeds in the exe (id 1),
 /// loaded at the shell's small-icon size so the tray picks the matching
-/// entry from `assets/venu.ico` at any display scaling instead of
+/// entry from `assets/nova.ico` at any display scaling instead of
 /// shrinking a large one.
 fn create_app_icon() -> windows::core::Result<HICON> {
     const APP_ICON_ID: usize = 1;
@@ -108,22 +108,24 @@ pub fn restore_settings_window() {
     request_settings_window();
 }
 
-/// Ask the already-running Venu instance to open its Settings window. This is
+/// Ask the already-running Nova instance to open its Settings window. This is
 /// used when a second launch explicitly supplies `--settings`.
 pub fn request_existing_settings() {
     unsafe {
-        let title = HSTRING::from("VenuTray");
-        // The primary process may still be creating its hidden tray window
-        // after acquiring the single-instance mutex.
+        // The primary process may still be creating its hidden tray window.
+        // Also recognise the previous title during the Venu -> Nova upgrade.
         for _ in 0..20 {
-            if let Ok(hwnd) = FindWindowW(None, PCWSTR(title.as_ptr())) {
-                if !hwnd.is_invalid() {
-                    if PostMessageW(hwnd, WM_VENU_OPEN_SETTINGS, WPARAM(0), LPARAM(0)).is_ok() {
-                        crate::startup_log::record_event("settings_request_posted_to_primary");
-                    } else {
-                        crate::startup_log::record_event("settings_request_post_failed");
+            for window_title in ["NovaTray", "VenuTray"] {
+                let title = HSTRING::from(window_title);
+                if let Ok(hwnd) = FindWindowW(None, PCWSTR(title.as_ptr())) {
+                    if !hwnd.is_invalid() {
+                        if PostMessageW(hwnd, WM_NOVA_OPEN_SETTINGS, WPARAM(0), LPARAM(0)).is_ok() {
+                            crate::startup_log::record_event("settings_request_posted_to_primary");
+                        } else {
+                            crate::startup_log::record_event("settings_request_post_failed");
+                        }
+                        return;
                     }
-                    return;
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -149,7 +151,7 @@ impl SystemTray {
             let hwnd = CreateWindowExW(
                 Default::default(),
                 PCWSTR(class_hstr.as_ptr()),
-                PCWSTR(HSTRING::from("VenuTray").as_ptr()),
+                PCWSTR(HSTRING::from("NovaTray").as_ptr()),
                 WS_POPUP,
                 0,
                 0,
@@ -174,7 +176,7 @@ impl SystemTray {
                 ..Default::default()
             };
 
-            let tip = "Venu - Dynamic Notch for Windows\0"
+            let tip = "Nova - Dynamic Notch for Windows\0"
                 .encode_utf16()
                 .collect::<Vec<u16>>();
             let len = tip.len().min(nid.szTip.len());
@@ -192,7 +194,7 @@ impl SystemTray {
             WM_TASKBAR_CREATED.store(taskbar_created, Ordering::SeqCst);
 
             if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
-                debug_log("Venu: Shell_NotifyIconW(NIM_ADD) failed — tray icon not registered yet, will retry on TaskbarCreated");
+                debug_log("Nova: Shell_NotifyIconW(NIM_ADD) failed — tray icon not registered yet, will retry on TaskbarCreated");
             }
 
             Ok(Self { hwnd, nid, hicon })
@@ -206,7 +208,7 @@ impl SystemTray {
         lparam: LPARAM,
     ) -> LRESULT {
         match msg {
-            WM_VENU_OPEN_SETTINGS => {
+            WM_NOVA_OPEN_SETTINGS => {
                 crate::startup_log::record_event("settings_request_message_received");
                 restore_settings_window();
                 LRESULT(0)

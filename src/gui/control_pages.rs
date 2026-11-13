@@ -576,17 +576,45 @@ impl SettingsApp {
     }
 
     pub(super) fn tab_slides_media(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        Self::section_title(ui, "STANDBY");
+        Self::row_inline(ui, "Face while closed", |ui| {
+            let current = cx.cfg.notch.default_collapsed;
+            egui::ComboBox::from_id_salt("media_standby_face")
+                .selected_text(current.label())
+                .show_ui(ui, |ui| {
+                    for mode in crate::config::CollapsedMode::ALL {
+                        if ui
+                            .selectable_value(
+                                &mut cx.cfg.notch.default_collapsed,
+                                mode,
+                                mode.label(),
+                            )
+                            .clicked()
+                        {
+                            *cx.changed = true;
+                        }
+                    }
+                });
+        });
+        Self::note(
+            ui,
+            "Choose Clock to keep the clock visible while music plays. Dynamic / Auto switches to Now Playing automatically.",
+        );
+
         Self::section_title(ui, "NOW PLAYING");
         let media = &mut cx.cfg.notch.media;
         *cx.changed |= ui
             .toggle(&mut media.live_wave, "Bars follow the music")
             .changed();
+        *cx.changed |= ui
+            .toggle(&mut media.lyrics, "Show lyrics when available")
+            .changed();
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "The little equaliser on the pill, the media pod and the player moves with \
-                 what is actually playing. It redraws 25 times a second while music plays and \
-                 not at all otherwise; off, the bars stand still.",
+                "Lyrics are matched from the title and artist exposed by Windows, so Spotify, \
+                 YouTube in a browser, and other media apps use the same lightweight path. \
+                 The album cover stays circular and rotates while playback is active.",
             )
             .size(11.0)
             .color(theme::text_secondary()),
@@ -597,9 +625,8 @@ impl SettingsApp {
             ui,
             "Player size",
             Some(
-                "Auto opens a centred player: the cover or video thumbnail large in the middle, \
-                 title, channel and the timeline under it. A short, wide size lays it out side \
-                 by side instead.",
+                "Every size is responsive. Wide panels use columns; narrow panels move lyrics \
+                 below the player and hide secondary details before anything can overlap.",
             ),
             |ui| {
                 Self::size_pair(
@@ -620,7 +647,7 @@ impl SettingsApp {
         Self::section_title(ui, "PINNED");
         ui.label(
             RichText::new(
-                "Files, folders, apps and scripts, one click away in the notch. Venu stores \
+                "Files, folders, apps and scripts, one click away in the notch. Nova stores \
                  only the path: nothing is copied or moved. You can also drop files on the \
                  notch, and right-click an item there for more.",
             )
@@ -700,7 +727,7 @@ impl SettingsApp {
             RichText::new(
                 "Show the newest files of one folder beside the pins, such as Screenshots or \
                  Downloads. Click one to open it; right-click to copy it, ready to paste into \
-                 a chat or a document. Venu only looks again when Windows says the folder \
+                 a chat or a document. Nova only looks again when Windows says the folder \
                  changed.",
             )
             .size(11.0)
@@ -752,7 +779,7 @@ impl SettingsApp {
         Self::section_title(ui, "CLIPBOARD HISTORY");
         let clip: &mut ClipboardConfig = &mut cx.cfg.notch.clipboard;
         if ui
-            .toggle(&mut clip.enabled, "Remember text I copy")
+            .toggle(&mut clip.enabled, "Remember text and screenshots I copy")
             .changed()
         {
             *cx.changed = true;
@@ -765,7 +792,7 @@ impl SettingsApp {
         ui.label(
             RichText::new(
                 "The last few things you copied, one click to copy again. Kept in memory only: \
-                 never written to disk, gone when Venu closes or this is switched off. Anything \
+                 never written to disk, gone when Nova closes or this is switched off. Anything \
                  a password manager marks as private is skipped.",
             )
             .size(11.0)
@@ -774,6 +801,9 @@ impl SettingsApp {
         ui.add_space(12.0);
         let clip = &mut cx.cfg.notch.clipboard;
         if clip.enabled {
+            *cx.changed |= ui
+                .toggle(&mut clip.images, "Show copied images and screenshots")
+                .changed();
             *cx.changed |= Self::slider_line(
                 ui,
                 "Keep",

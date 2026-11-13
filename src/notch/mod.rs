@@ -31,10 +31,12 @@ pub mod geom;
 pub mod hook;
 pub mod keys;
 pub mod layout;
+pub mod lyrics;
 pub mod media;
 pub mod menu;
 pub mod notify;
 pub mod paint;
+pub mod prayer;
 pub mod shelf;
 pub mod state;
 pub mod surface;
@@ -155,7 +157,7 @@ impl NotchManager {
             // Nothing runs for a notch that is not there: no folder watcher,
             // and above all no clipboard history being collected unseen.
             shelf::sync(&Default::default(), false, false);
-            clipboard::sync(false, 0);
+            clipboard::sync(false, 0, false);
             return false;
         }
 

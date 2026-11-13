@@ -143,25 +143,6 @@ pub(crate) fn power_value(
     }
 }
 
-pub(crate) fn power_hint(
-    battery_present: Option<bool>,
-    battery_pct: Option<u8>,
-    ac_online: Option<bool>,
-    charging: bool,
-) -> &'static str {
-    match (battery_present, battery_pct, ac_online, charging) {
-        (_, Some(_), _, true) => "Charging",
-        (_, Some(_), Some(true), false) => "Plugged in",
-        (_, Some(_), Some(false), false) => "On battery",
-        (Some(false), _, Some(true), _) => "Desktop AC power",
-        (Some(false), _, _, _) => "No battery detected",
-        (Some(true), None, Some(true), _) => "AC power · charge unavailable",
-        (Some(true), None, Some(false), _) => "Battery · charge unavailable",
-        (_, _, Some(true), _) => "AC power",
-        _ => "Unavailable",
-    }
-}
-
 pub(crate) fn format_bytes(bytes: u64) -> String {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;
@@ -302,10 +283,6 @@ mod tests {
         assert_eq!(
             power_value(None, false, Some(true), Some(false)),
             "AC POWER"
-        );
-        assert_eq!(
-            power_hint(Some(false), None, Some(true), false),
-            "Desktop AC power"
         );
         assert_eq!(power_value(None, true, Some(true), None), "AC POWER");
     }

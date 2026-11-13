@@ -19,11 +19,6 @@ fn font_definitions() -> egui::FontDefinitions {
         "NotoSansDevanagari".to_owned(),
         egui::FontData::from_static(include_bytes!("../../NotoSansDevanagari.ttf")),
     );
-    fonts.font_data.insert(
-        "PlusJakartaSans".to_owned(),
-        egui::FontData::from_static(include_bytes!("../../PlusJakartaSans.ttf")),
-    );
-
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
@@ -46,31 +41,10 @@ fn font_definitions() -> egui::FontDefinitions {
         .or_default()
         .insert(1, "NotoSansDevanagari".to_owned());
 
-    // Windows' own emoji font, ahead of egui's small bundled set, which lacks
-    // some everyday emoji (🙏 among them) and stands a wrong glyph in for
-    // them. Read from disk rather than bundled: every Windows install has it,
-    // and only the glyphs actually drawn are ever rasterised.
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_owned());
-    if let Ok(bytes) = std::fs::read(format!(r"{windir}\Fonts\seguiemj.ttf")) {
-        fonts
-            .font_data
-            .insert("SegoeEmoji".to_owned(), egui::FontData::from_owned(bytes));
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts
-                .families
-                .entry(family)
-                .or_default()
-                .insert(2, "SegoeEmoji".to_owned());
-        }
-    }
-
-    // Keep the prior bundled family available to configs that explicitly
-    // selected it. The defaults and migrated configurations use Geist.
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .push("PlusJakartaSans".to_owned());
+    // Do not load the 12+ MB Segoe UI Emoji file into egui. The native notch
+    // uses DirectWrite and retains Windows' complete font fallback; Settings
+    // needs only the bundled UI scripts and otherwise duplicated the emoji
+    // font (raw bytes plus the parsed face) for its entire lifetime.
 
     fonts
 }
@@ -87,7 +61,7 @@ mod tests {
 
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.label("Venu settings");
+                ui.label("Nova settings");
                 ui.monospace("CPU 0.0% · नमस्ते");
             });
         });
@@ -97,10 +71,8 @@ mod tests {
             "the headless frame should paint text"
         );
         ctx.fonts(|fonts| {
-            assert!(fonts.has_glyphs(&FontId::proportional(18.0), "Venu नमस्ते"));
+            assert!(fonts.has_glyphs(&FontId::proportional(18.0), "Nova नमस्ते"));
             assert!(fonts.has_glyphs(&FontId::monospace(18.0), "CPU 0.0% नमस्ते"));
-            // From Windows' own emoji font; egui's bundled set lacks it.
-            assert!(fonts.has_glyphs(&FontId::proportional(18.0), "\u{1F64F}"));
         });
     }
 }

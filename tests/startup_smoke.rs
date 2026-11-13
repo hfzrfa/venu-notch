@@ -12,8 +12,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, WM_CLOSE, WM_LBUTTONUP, WM_USER,
 };
 
-const TRAY_TITLE: &str = "VenuTray";
-const SETTINGS_TITLE: &str = "Venu - Settings";
+const TRAY_TITLE: &str = "NovaTray";
+const SETTINGS_TITLE: &str = "Nova - Settings";
 // Must stay in sync with WM_TRAY_ICON in src/tray.rs.
 const WM_TRAY_ICON: u32 = WM_USER + 101;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -39,14 +39,14 @@ impl SoftwareOpenGlRuntime {
         let mut runtime = Self {
             copied_files: Vec::new(),
         };
-        let Some(source_dir) = std::env::var_os("VENU_STARTUP_TEST_OPENGL_DIR").map(PathBuf::from)
+        let Some(source_dir) = std::env::var_os("NOVA_STARTUP_TEST_OPENGL_DIR").map(PathBuf::from)
         else {
             return runtime;
         };
-        let executable = PathBuf::from(env!("CARGO_BIN_EXE_venu"));
+        let executable = PathBuf::from(env!("CARGO_BIN_EXE_nova"));
         let executable_dir = executable
             .parent()
-            .expect("Venu executable has a parent directory");
+            .expect("Nova executable has a parent directory");
 
         for file_name in ["opengl32.dll", "libgallium_wgl.dll"] {
             let source = source_dir.join(file_name);
@@ -82,7 +82,7 @@ impl ChildProcess {
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let diagnostic_dir = temp_root.join(format!(
-            "venu-startup-smoke-{}-{label}-{nonce}",
+            "nova-startup-smoke-{}-{label}-{nonce}",
             std::process::id()
         ));
         let local_app_data = diagnostic_dir.join("LocalAppData");
@@ -92,15 +92,15 @@ impl ChildProcess {
 
         let stdout = File::create(diagnostic_dir.join("stdout.log")).expect("create stdout log");
         let stderr = File::create(diagnostic_dir.join("stderr.log")).expect("create stderr log");
-        let child = Command::new(env!("CARGO_BIN_EXE_venu"))
+        let child = Command::new(env!("CARGO_BIN_EXE_nova"))
             .args(args)
             .env("APPDATA", roaming_app_data)
             .env("LOCALAPPDATA", local_app_data)
-            .env("VENU_STARTUP_SMOKE", "1")
+            .env("NOVA_STARTUP_SMOKE", "1")
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()
-            .expect("Venu should start");
+            .expect("Nova should start");
         Self {
             child,
             diagnostic_dir,
@@ -119,7 +119,7 @@ impl ChildProcess {
             .expect("query child process")
             .is_some()
         {
-            panic!("Venu exited during {phase}.\n{}", self.diagnostics(phase));
+            panic!("Nova exited during {phase}.\n{}", self.diagnostics(phase));
         }
     }
 
@@ -143,7 +143,7 @@ impl ChildProcess {
             &self
                 .diagnostic_dir
                 .join("LocalAppData")
-                .join("Venu")
+                .join("Nova")
                 .join("startup.log"),
         );
         let stdout = read_diagnostic_file(&self.diagnostic_dir.join("stdout.log"));
@@ -179,15 +179,15 @@ impl ChildProcess {
             .expect("create secondary stdout log");
         let stderr = File::create(self.diagnostic_dir.join(format!("{label}.stderr.log")))
             .expect("create secondary stderr log");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_venu"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_nova"))
             .args(args)
             .env("APPDATA", self.diagnostic_dir.join("AppData"))
             .env("LOCALAPPDATA", self.diagnostic_dir.join("LocalAppData"))
-            .env("VENU_STARTUP_SMOKE", "1")
+            .env("NOVA_STARTUP_SMOKE", "1")
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()
-            .expect("launch secondary Venu request");
+            .expect("launch secondary Nova request");
         let deadline = Instant::now() + WINDOW_TIMEOUT;
         loop {
             if let Some(status) = child.try_wait().expect("query secondary process") {
@@ -197,7 +197,7 @@ impl ChildProcess {
                 let _ = child.kill();
                 let status = child.wait().ok();
                 panic!(
-                    "secondary Venu request {args:?} did not exit within {WINDOW_TIMEOUT:?} (status {status:?}).\n{}",
+                    "secondary Nova request {args:?} did not exit within {WINDOW_TIMEOUT:?} (status {status:?}).\n{}",
                     self.diagnostics(label)
                 );
             }

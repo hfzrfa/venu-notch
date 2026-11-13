@@ -18,24 +18,27 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::System::Console::FreeConsole;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT,
 };
 
-/// Frame interval for the overlay thread while something is actually moving.
-const FRAME_MS: u32 = 16;
+/// Fallback frame interval when desktop composition cannot provide a vblank.
+/// With DWM active, `DwmFlush` below paces frames at the monitor's own refresh
+/// rate instead of forcing a drifting 16 ms approximation.
+const FRAME_FALLBACK_MS: u32 = 8;
 
 /// Interval the overlay thread falls back to once nothing is animating.
 ///
-/// Venu spends nearly all of its life like this: a collapsed pill showing the
+/// Nova spends nearly all of its life like this: a collapsed pill showing the
 /// same thing it showed a second ago. A tick at this rate reads the cursor,
 /// drains the input bus and advances the springs — all of it arithmetic and a
 /// syscall or two — and paints nothing, so the notch still opens the instant
 /// the cursor reaches it without the process drawing sixty identical frames a
 /// second to sit still.
-const IDLE_POLL_MS: u32 = 32;
+const IDLE_POLL_MS: u32 = 16;
 
 use config::AppConfig;
 use flash::FlashManager;
@@ -45,14 +48,14 @@ use notch::NotchManager;
 use overlay::OverlayManager;
 use tray::SystemTray;
 
-/// The Venu logo, for the Settings window title bar and taskbar button.
+/// The Nova logo, for the Settings window title bar and taskbar button.
 ///
 /// Decoded from the same PNG that `scripts/gen-icon.ps1` builds the exe icon
 /// from, and scaled to 64px: large enough for the taskbar at 200% scaling,
 /// small enough not to hand winit a megabyte of pixels it would shrink anyway.
 fn create_app_icon_data() -> Option<egui::IconData> {
     const SIZE: u32 = 64;
-    let logo = image::load_from_memory(include_bytes!("../assets/icon.png")).ok()?;
+    let logo = image::load_from_memory(include_bytes!("../assets/nova-logo.png")).ok()?;
     let rgba = logo
         .resize_exact(SIZE, SIZE, image::imageops::FilterType::Lanczos3)
         .into_rgba8()
@@ -69,30 +72,37 @@ fn create_app_icon_data() -> Option<egui::IconData> {
 /// finds it taken and quietly exits instead of fighting over the notch.
 fn acquire_single_instance() -> bool {
     unsafe {
-        let name = HSTRING::from("Local\\Venu.SingleInstance");
-        match CreateMutexW(None, false, PCWSTR(name.as_ptr())) {
-            Ok(handle) => {
-                // Bound but never closed: the mutex must outlive `main`, and
-                // HANDLE carries no destructor of its own.
-                let _ = handle;
-                GetLastError() != ERROR_ALREADY_EXISTS
+        // Claim both names during the rename. Nova then refuses to start
+        // beside an older Venu build, and an older build sees our legacy
+        // mutex and refuses to start beside Nova.
+        for mutex_name in ["Local\\Venu.SingleInstance", "Local\\Nova.SingleInstance"] {
+            let name = HSTRING::from(mutex_name);
+            match CreateMutexW(None, false, PCWSTR(name.as_ptr())) {
+                Ok(handle) => {
+                    // Bound but never closed: each mutex must outlive `main`.
+                    let _ = handle;
+                    if GetLastError() == ERROR_ALREADY_EXISTS {
+                        return false;
+                    }
+                }
+                // If one compatibility mutex cannot be created, keep trying
+                // the canonical one rather than refusing to start.
+                Err(_) => continue,
             }
-            // If the mutex cannot be created, assume we are alone rather than
-            // refusing to start for everyone.
-            Err(_) => true,
         }
+        true
     }
 }
 
 /// Keep launch-on-startup and the saved preference in step.
 ///
 /// Store build: Windows owns the startup task, so the preference simply
-/// follows what Windows says — including the user switching Venu off in
+/// follows what Windows says — including the user switching Nova off in
 /// Settings › Apps › Startup. Nothing is ever switched on from here.
 ///
 /// Registry build:
 /// - Preference on: rewrite the entry every run, so an updated or moved
-///   `venu.exe` never leaves a stale path registered for sign-in.
+///   `nova.exe` never leaves a stale path registered for sign-in.
 /// - Preference off but an entry exists: the installer wrote it, or the
 ///   config file was reset. Adopt it, so the toggle in Preferences matches
 ///   what actually happens at sign-in.
@@ -187,7 +197,7 @@ fn run_overlay_thread(overlay_config: Arc<RwLock<AppConfig>>) {
         last_instant = now;
 
         // Each of these reports whether it still has something in flight.
-        // None of them do while Venu sits in the tray with the notch shut,
+        // None of them do while Nova sits in the tray with the notch shut,
         // which is the state it is in almost all of the time.
         let mut animating = {
             let cfg = overlay_config.read();
@@ -199,8 +209,20 @@ fn run_overlay_thread(overlay_config: Arc<RwLock<AppConfig>>) {
         // Takes its own lock: inline editing writes back into the config.
         animating |= notch.tick(dt);
 
-        let budget = if animating { FRAME_MS } else { IDLE_POLL_MS };
-        next_tick = now + Duration::from_millis(budget as u64);
+        if animating {
+            // A layered window has no swap chain to present with vsync.
+            // Waiting for DWM's next composition pass gives it the same even
+            // frame cadence: 60 Hz displays get 60 frames, 120/144 Hz displays
+            // can use their extra refreshes, and render time cannot accumulate
+            // timer drift. Keep a bounded fallback for composition failures.
+            if unsafe { DwmFlush() }.is_ok() {
+                next_tick = Instant::now();
+            } else {
+                next_tick = now + Duration::from_millis(FRAME_FALLBACK_MS as u64);
+            }
+        } else {
+            next_tick = now + Duration::from_millis(IDLE_POLL_MS as u64);
+        }
     }
 }
 
@@ -238,7 +260,7 @@ fn main() {
     // Spawn Overlay Render, System Tray & Win32 Message Loop thread.
     let overlay_config = Arc::clone(&config);
     let overlay_thread = std::thread::Builder::new()
-        .name("Venu overlay".to_owned())
+        .name("Nova overlay".to_owned())
         .spawn(move || {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_overlay_thread(overlay_config)
@@ -292,7 +314,7 @@ fn main() {
     // them thin. It draws its own title bar so the glass runs edge to edge.
     let pinned = config.read().settings_window.pinned;
     let mut viewport_builder = eframe::egui::ViewportBuilder::default()
-        .with_title("Venu - Settings")
+        .with_title("Nova - Settings")
         .with_inner_size(gui::WINDOW_SIZE)
         .with_min_inner_size(gui::MIN_WINDOW_SIZE)
         .with_resizable(true)
@@ -317,7 +339,7 @@ fn main() {
 
     let gui_config = Arc::clone(&config);
     if let Err(error) = eframe::run_native(
-        "Venu",
+        "Nova",
         native_options,
         Box::new(move |cc| Ok(Box::new(SettingsApp::new(cc, gui_config, show_settings)))),
     ) {

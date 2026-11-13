@@ -39,7 +39,7 @@ unsafe extern "system" fn enum_windows_callback(
         let len = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buffer);
         if len > 0 {
             let text = String::from_utf16_lossy(&buffer[..len as usize]);
-            if (text.contains("Venu") || text.contains("MovingText")) && !text.contains("Tray") {
+            if (text.contains("Nova") || text.contains("MovingText")) && !text.contains("Tray") {
                 let out_ptr = lparam.0 as *mut isize;
                 *out_ptr = hwnd.0 as isize;
                 return windows::Win32::Foundation::BOOL(0);
@@ -58,7 +58,7 @@ pub unsafe fn find_settings_hwnd() -> Option<windows::Win32::Foundation::HWND> {
         }
     }
 
-    let title = windows::core::HSTRING::from("Venu - Settings");
+    let title = windows::core::HSTRING::from("Nova - Settings");
     if let Ok(hwnd) = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
         None,
         windows::core::PCWSTR(title.as_ptr()),
@@ -419,11 +419,6 @@ const PAGES: &[Page] = &[
                 draw: SettingsApp::tab_slides_marquee,
             },
             Tab {
-                title: "Stats",
-                keywords: "cpu ram memory gpu power battery system usage monitor",
-                draw: SettingsApp::page_app_stats,
-            },
-            Tab {
                 title: "Timer",
                 keywords: "pomodoro focus timer break rounds countdown",
                 draw: SettingsApp::tab_slides_timer,
@@ -432,6 +427,11 @@ const PAGES: &[Page] = &[
                 title: "Calendar",
                 keywords: "calendar events meetings ical ics google outlook agenda",
                 draw: SettingsApp::tab_slides_calendar,
+            },
+            Tab {
+                title: "Prayer Times",
+                keywords: "prayer salat sholat subuh zuhur asar magrib isya location",
+                draw: SettingsApp::tab_prayer_times,
             },
         ],
     },
@@ -593,7 +593,7 @@ pub struct SettingsApp {
     /// Decoded wallpaper, kept between frames so the preview does not re-read
     /// the file sixty times a second.
     preview: wallpaper::PreviewCache,
-    /// Whether the window is on screen. Venu is a tray app: most of the time
+    /// Whether the window is on screen. Nova is a tray app: most of the time
     /// this is false, and a hidden window has nothing worth redrawing.
     on_screen: bool,
     /// The search box. Non-empty, the rail lists matching tabs instead.
@@ -648,16 +648,16 @@ fn flash_interval_text(v: f64) -> String {
 
 /// The logo for the rail, decoded once at a size that stays crisp at 200%.
 fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let image = image::load_from_memory(include_bytes!("../../assets/icon.png")).ok()?;
+    let image = image::load_from_memory(include_bytes!("../../assets/nova-logo.png")).ok()?;
     let image = image
         .resize_exact(64, 64, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
     let pixels = egui::ColorImage::from_rgba_unmultiplied([64, 64], image.as_raw());
-    Some(ctx.load_texture("venu_logo", pixels, egui::TextureOptions::LINEAR))
+    Some(ctx.load_texture("nova_logo", pixels, egui::TextureOptions::LINEAR))
 }
 
 impl SettingsApp {
-    /// `on_screen` is false when Venu was started into the tray, which is what
+    /// `on_screen` is false when Nova was started into the tray, which is what
     /// the sign-in entry does.
     pub fn new(
         cc: &eframe::CreationContext<'_>,
@@ -752,7 +752,7 @@ impl SettingsApp {
         ui.painter().hline(
             line.x_range(),
             line.center().y,
-            Stroke::new(1.0, theme::divider()),
+            Stroke::new(1.0_f32, theme::divider()),
         );
         ui.add_space(16.0);
     }
@@ -802,7 +802,7 @@ impl SettingsApp {
             ui.painter().circle_stroke(
                 center,
                 12.0,
-                Stroke::new(1.6, Color32::WHITE.gamma_multiply(ring)),
+                Stroke::new(1.6_f32, Color32::WHITE.gamma_multiply(ring)),
             );
         }
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -867,7 +867,7 @@ impl SettingsApp {
         ui.painter().text(
             egui::pos2(text_x, rect.center().y - 7.0),
             Align2::LEFT_CENTER,
-            "Venu",
+            "Nova",
             egui::FontId::proportional(14.5),
             theme::text_primary(),
         );
@@ -895,7 +895,7 @@ impl SettingsApp {
             Rounding::same(8.0),
             Color32::from_black_alpha(45),
             Stroke::new(
-                1.0,
+                1.0_f32,
                 lerp_color(
                     Color32::from_white_alpha(12),
                     theme::accent().gamma_multiply(0.8),
@@ -1139,7 +1139,7 @@ impl SettingsApp {
         let mut picked = None;
         Frame::none()
             .fill(Color32::from_black_alpha(45))
-            .stroke(Stroke::new(1.0, Color32::from_white_alpha(10)))
+            .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(10)))
             .rounding(Rounding::same(10.0))
             .inner_margin(Margin::same(3.0))
             .show(ui, |ui| {
@@ -1410,6 +1410,113 @@ impl SettingsApp {
         Self::sec_calendar(ui, cx.cfg, cx.changed);
     }
 
+    fn tab_prayer_times(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        let mut location_error = None;
+        if let Some(result) = crate::notch::prayer::take_detected_location() {
+            match result {
+                Ok(found) => {
+                    cx.cfg.notch.prayer.latitude = found.latitude;
+                    cx.cfg.notch.prayer.longitude = found.longitude;
+                    cx.cfg.notch.prayer.location_name = found.label.unwrap_or_else(|| {
+                        format!("{:.4}, {:.4}", found.latitude, found.longitude)
+                    });
+                    *cx.changed = true;
+                }
+                Err(error) => location_error = Some(error),
+            }
+        }
+
+        Self::section_title(ui, "PRAYER REMINDERS");
+        let prayer = &mut cx.cfg.notch.prayer;
+        *cx.changed |= ui
+            .toggle(
+                &mut prayer.enabled,
+                "Show a notch popup when prayer time begins",
+            )
+            .changed();
+        *cx.changed |= ui
+            .toggle(
+                &mut prayer.show_on_clock,
+                "Show prayer timeline and H-10 reminder on the Clock slide",
+            )
+            .changed();
+        *cx.changed |= ui
+            .toggle(
+                &mut prayer.automatic_location,
+                "Use Windows automatic location",
+            )
+            .changed();
+        ui.add_space(6.0);
+        if prayer.automatic_location {
+            if ui.button("Detect my location now").clicked() {
+                if let Err(error) = crate::notch::prayer::request_auto_location() {
+                    location_error = Some(error);
+                }
+            }
+            ui.label(
+                RichText::new(location_error.unwrap_or_else(crate::notch::prayer::location_status))
+                    .size(11.0)
+                    .color(theme::text_secondary()),
+            );
+        }
+        ui.add_space(10.0);
+        Self::row_stacked(ui, "Location label", None, |ui| {
+            *cx.changed |= ui
+                .add(egui::TextEdit::singleline(&mut prayer.location_name).desired_width(260.0))
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Latitude");
+            *cx.changed |= ui
+                .add(
+                    egui::DragValue::new(&mut prayer.latitude)
+                        .speed(0.01)
+                        .range(-90.0..=90.0),
+                )
+                .changed();
+            ui.label("Longitude");
+            *cx.changed |= ui
+                .add(
+                    egui::DragValue::new(&mut prayer.longitude)
+                        .speed(0.01)
+                        .range(-180.0..=180.0),
+                )
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Schedule correction");
+            *cx.changed |= ui
+                .add(egui::Slider::new(&mut prayer.adjustment_minutes, -15..=15).suffix(" min"))
+                .changed();
+        });
+        ui.add_space(12.0);
+        Self::section_title(ui, "TODAY");
+        ui.horizontal_wrapped(|ui| {
+            for time in crate::notch::prayer::today_schedule(prayer) {
+                ui.label(
+                    RichText::new(format!(
+                        "{}  {:02}:{:02}",
+                        time.name,
+                        time.minute / 60,
+                        time.minute % 60
+                    ))
+                    .font(egui::FontId::monospace(11.5))
+                    .color(theme::text_primary()),
+                );
+                ui.add_space(10.0);
+            }
+        });
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(
+                "Times are calculated locally with Kemenag angles. Automatic location is only \
+                 requested when you press the button; no continuous GPS tracking is used.",
+            )
+            .size(11.0)
+            .color(theme::text_secondary()),
+        );
+    }
+
     /// "This slide is not in the deck. Add it" — shown on a slide's own tab
     /// when it is switched off, so setting it up never dead-ends.
     fn deck_hint(ui: &mut egui::Ui, cfg: &mut AppConfig, kind: SlideKind, changed: &mut bool) {
@@ -1530,12 +1637,17 @@ impl SettingsApp {
 
         Self::section_title(ui, "YOUR CALENDAR");
         let cal = &mut cfg.notch.calendar;
+        ui.label(
+            RichText::new("Choose ONE connection method. Example text inside an empty field is not saved data.")
+                .size(11.0)
+                .color(theme::text_secondary()),
+        );
+        ui.add_space(6.0);
         Self::row_stacked(
             ui,
             "iCal link",
             Some(
-                "Google Calendar: Settings \u{2192} your calendar \u{2192} \u{201C}Secret address \
-                 in iCal format\u{201D}. Outlook: Settings \u{2192} Calendar \u{2192} Shared \
+                "For a private Google calendar, copy—not construct—the “Secret address in iCal format” from Settings → your calendar → Integrate calendar. A /public/basic.ics link only works when the calendar is public. Outlook: Settings → Calendar → Shared \
                  calendars \u{2192} Publish, then copy the ICS link. A path to an .ics file \
                  works too.",
             ),
@@ -1545,7 +1657,7 @@ impl SettingsApp {
                         egui::TextEdit::singleline(&mut cal.source)
                             .hint_text(
                                 RichText::new(
-                                    "https://calendar.google.com/calendar/ical/.../basic.ics",
+                                    "Paste the complete secret iCal URL here",
                                 )
                                 .color(theme::text_tertiary()),
                             )
@@ -1558,6 +1670,34 @@ impl SettingsApp {
             },
         );
 
+        ui.add_space(8.0);
+        Self::row_stacked(
+            ui,
+            "Google Calendar API key",
+            Some(
+                "For a public calendar, enter an API key and Calendar ID. For a private calendar, use the secret iCal link above; an API key alone cannot sign in to a private Google account.",
+            ),
+            |ui| {
+                *changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut cal.google_api_key)
+                            .password(true)
+                            .hint_text("Paste your real API key here")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .changed();
+            },
+        );
+        Self::row_stacked(ui, "Google Calendar ID", Some("Usually the calendar email address, or the ID shown in Google Calendar integration settings."), |ui| {
+            *changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut cal.google_calendar_id)
+                        .hint_text("Paste the actual Calendar ID here")
+                        .desired_width(f32::INFINITY),
+                )
+                .changed();
+        });
+
         let status = calendar::status();
         ui.horizontal(|ui| {
             let (text, tone) = match &status {
@@ -1569,7 +1709,10 @@ impl SettingsApp {
             let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
             ui.painter().circle_filled(dot.center(), 3.5, tone);
             ui.label(RichText::new(text).size(11.5).color(tone));
-            if !cal.source.trim().is_empty() && ui.small_button("Refresh now").clicked() {
+            let configured = !cal.source.trim().is_empty()
+                || (!cal.google_api_key.trim().is_empty()
+                    && !cal.google_calendar_id.trim().is_empty());
+            if configured && ui.small_button("Refresh now").clicked() {
                 calendar::refresh_now();
             }
         });
@@ -1686,168 +1829,6 @@ impl SettingsApp {
         Self::sec_flash_anim(ui, cx.cfg, cx.changed);
     }
 
-    fn page_app_stats(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_secs(1));
-
-        let stats = crate::stats::snapshot();
-        let metrics = [
-            ("CPU", stats.cpu_pct, "All processors"),
-            ("RAM", stats.ram_pct, "Physical memory"),
-            ("GPU", stats.gpu_pct, "Busiest engine across the PC"),
-        ];
-
-        Frame::none()
-            .fill(theme::surface())
-            .stroke(Stroke::new(1.0_f32, theme::divider()))
-            .rounding(Rounding::same(14.0))
-            .inner_margin(Margin::same(20.0))
-            .show(ui, |ui| {
-                ui.set_min_height(206.0);
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("YOUR PC")
-                                .size(10.0)
-                                .strong()
-                                .color(theme::text_tertiary()),
-                        );
-                        ui.label(
-                            RichText::new("Whole-system overview")
-                                .size(15.0)
-                                .strong()
-                                .color(theme::text_primary()),
-                        );
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("UPDATES EVERY SECOND")
-                                .size(9.0)
-                                .strong()
-                                .color(theme::text_tertiary()),
-                        );
-                        ui.add_space(7.0);
-                        let (dot_rect, _) =
-                            ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
-                        ui.painter()
-                            .circle_filled(dot_rect.center(), 3.5, theme::accent());
-                    });
-                });
-
-                ui.add_space(16.0);
-                ui.columns(3, |columns| {
-                    for (column, (label, value, hint)) in columns.iter_mut().zip(metrics) {
-                        column.label(
-                            RichText::new(label)
-                                .size(10.0)
-                                .strong()
-                                .color(theme::text_tertiary()),
-                        );
-                        let sample = value;
-                        let rendered_value = sample
-                            .map(|pct| format!("{pct:.0}%"))
-                            .unwrap_or_else(|| "—".to_string());
-                        column.label(
-                            RichText::new(rendered_value)
-                                .font(egui::FontId::new(29.0, egui::FontFamily::Monospace))
-                                .strong()
-                                .color(theme::text_primary()),
-                        );
-                        column.add_space(2.0);
-                        column.label(
-                            RichText::new(hint)
-                                .size(10.5)
-                                .color(theme::text_secondary()),
-                        );
-                        if let Some(pct) = sample {
-                            column.add_space(8.0);
-                            column.add(
-                                egui::ProgressBar::new(pct / 100.0)
-                                    .desired_width(column.available_width()),
-                            );
-                        } else {
-                            column.add_space(11.0);
-                            column.label(
-                                RichText::new("Waiting for sample")
-                                    .size(9.5)
-                                    .color(theme::text_tertiary()),
-                            );
-                        }
-                    }
-                });
-
-                ui.add_space(13.0);
-                ui.separator();
-                ui.add_space(5.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new("MEMORY")
-                            .size(9.0)
-                            .strong()
-                            .color(theme::text_tertiary()),
-                    );
-                    let memory = if stats.ram_total > 0 {
-                        format!(
-                            "{} of {}",
-                            crate::stats::format_bytes(stats.ram_used),
-                            crate::stats::format_bytes(stats.ram_total)
-                        )
-                    } else {
-                        "—".to_string()
-                    };
-                    ui.label(
-                        RichText::new(memory)
-                            .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
-                            .color(theme::text_primary()),
-                    );
-                    ui.add_space(18.0);
-                    ui.label(
-                        RichText::new("POWER")
-                            .size(9.0)
-                            .strong()
-                            .color(theme::text_tertiary()),
-                    );
-                    ui.label(
-                        RichText::new(stats.power_value())
-                            .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
-                            .color(theme::text_primary()),
-                    );
-                    ui.label(
-                        RichText::new(format!("· {}", stats.power_hint()))
-                            .size(10.0)
-                            .color(theme::text_secondary()),
-                    );
-                });
-            });
-
-        ui.add_space(20.0);
-        Self::section_title(ui, "SHOW IN THE NOTCH");
-        let mut include_stats = cx.cfg.notch.slides.contains(&SlideKind::Stats);
-        if ui
-            .toggle(&mut include_stats, "Include Stats in the notch carousel")
-            .changed()
-        {
-            cx.cfg.notch.set_stats_enabled(include_stats);
-            *cx.changed = true;
-        }
-        let mut default_stats =
-            cx.cfg.notch.default_collapsed == crate::config::CollapsedMode::Stats;
-        if ui
-            .toggle(&mut default_stats, "Rest on Stats when the notch closes")
-            .changed()
-        {
-            cx.cfg.notch.set_stats_default(default_stats);
-            *cx.changed = true;
-        }
-        ui.label(
-            RichText::new(
-                "CPU and memory cover the entire PC. GPU is the busiest physical engine after combining its process readings.",
-            )
-            .size(10.5)
-            .color(theme::text_secondary()),
-        );
-    }
-
     fn tab_prefs_window(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
         let win = &mut cx.cfg.settings_window;
 
@@ -1922,7 +1903,7 @@ impl SettingsApp {
         });
         ui.label(
             RichText::new(
-                "Closing the window hides it to the tray; Venu keeps running. Press Ctrl+F \
+                "Closing the window hides it to the tray; Nova keeps running. Press Ctrl+F \
                  anywhere to search the settings.",
             )
             .size(11.0)
@@ -1934,11 +1915,11 @@ impl SettingsApp {
         Self::section_title(ui, "STARTUP");
         let store = crate::autostart::managed_by_windows();
         let help = if store {
-            "Start Venu quietly in the tray when you sign in to Windows. Windows manages this \
+            "Start Nova quietly in the tray when you sign in to Windows. Windows manages this \
              for the Store version: you can also switch it in Settings \u{203A} Apps \u{203A} \
              Startup, and what you choose there wins."
         } else {
-            "Start Venu quietly in the tray when you sign in to Windows. It lives under your \
+            "Start Nova quietly in the tray when you sign in to Windows. It lives under your \
              user's autostart key — no admin rights — and can also be paused from Task \
              Manager's Startup list."
         };
@@ -1951,7 +1932,7 @@ impl SettingsApp {
                 .on_hover_text(if store {
                     "Uses the Store app's Windows startup task"
                 } else {
-                    "Registers venu.exe under the per-user Run key"
+                    "Registers nova.exe under the per-user Run key"
                 });
             if check.changed() {
                 let result = if enabled {
@@ -1965,8 +1946,8 @@ impl SettingsApp {
                         *cx.changed = true;
                         match state {
                             crate::autostart::StartupState::BlockedByUser => Some(
-                                "Venu is switched off in Windows Settings \u{203A} Apps \u{203A} \
-                                 Startup. Switch it on there; Venu will not override your choice.",
+                                "Nova is switched off in Windows Settings \u{203A} Apps \u{203A} \
+                                 Startup. Switch it on there; Nova will not override your choice.",
                             ),
                             crate::autostart::StartupState::BlockedByPolicy => {
                                 Some("Your organisation's policy controls startup apps on this PC.")
@@ -3166,7 +3147,7 @@ impl SettingsApp {
         ui.add_space(2.0);
         ui.label(
             RichText::new(
-                "When you move your cursor away and the notch collapses, it returns to this face.",
+                "Fixed choices stay on that face even while music plays. Dynamic / Auto follows notifications and Now Playing, then returns to the clock.",
             )
             .size(11.0)
             .color(theme::text_secondary()),
@@ -3208,7 +3189,7 @@ impl SettingsApp {
                  for your permission first."
             } else {
                 "Showing notifications from every Windows app needs the Microsoft Store \
-                 version of Venu: Windows only lets packaged apps read the notification \
+                 version of Nova: Windows only lets packaged apps read the notification \
                  center. This build still shows alerts from the apps and tools above."
             })
             .size(11.0)
@@ -3243,7 +3224,7 @@ impl SettingsApp {
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "Venu keeps the latest four in memory for this session only. Clearing them in \
+                "Nova keeps the latest four in memory for this session only. Clearing them in \
                  the notch does not remove anything from Windows, and nothing is saved to disk.",
             )
             .size(11.0)
@@ -3373,7 +3354,7 @@ impl SettingsApp {
             rect,
             Rounding::same(13.0),
             theme::surface_hover(),
-            Stroke::new(1.0, theme::divider()),
+            Stroke::new(1.0_f32, theme::divider()),
         );
         let dot = Color32::from_rgb(
             (color[0] * 255.0) as u8,
@@ -3509,7 +3490,7 @@ impl SettingsApp {
         Self::section_title(ui, "SEND YOUR OWN");
         ui.label(
             RichText::new(
-                "Scripts, build tools and AI agents can raise an alert by posting JSON to Venu's \
+                "Scripts, build tools and AI agents can raise an alert by posting JSON to Nova's \
                  local address. It only listens on this PC.",
             )
             .size(11.0)
@@ -3563,7 +3544,7 @@ impl SettingsApp {
         ui.horizontal(|ui| {
             if ui.button("Send a test notification").clicked() {
                 crate::notch::notify::global_store().write().push(
-                    "Venu",
+                    "Nova",
                     "This is a test",
                     "Alerts from your allowed apps will look like this.",
                     crate::notch::notify::NotificationLevel::Info,
@@ -3592,6 +3573,24 @@ impl SettingsApp {
                 "Height",
                 egui::Slider::new(&mut n.collapsed_height, 18..=120).suffix(" px"),
             );
+            *changed |= ui
+                .checkbox(
+                    &mut n.minimize_when_idle,
+                    "Ultra-minimize to a thin top-edge line",
+                )
+                .on_hover_text(
+                    "Leaves only a 3 px black line while closed. Hover the line to reveal the standby pill, then keep hovering to open Nova.",
+                )
+                .changed();
+            *changed |= ui
+                .checkbox(
+                    &mut n.ambient_standby,
+                    "Ambient twin-light standby when idle",
+                )
+                .on_hover_text(
+                    "When nothing is playing, shows two soft status lights and a blue-violet edge glow. Music, lyrics and notifications still take priority.",
+                )
+                .changed();
         });
 
         Self::row_stacked(ui, "Expanded", Some("The panel it opens into."), |ui| {
@@ -4536,7 +4535,7 @@ impl eframe::App for SettingsApp {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            // Closing puts Venu back in the tray rather than ending it.
+            // Closing puts Nova back in the tray rather than ending it.
             crate::startup_log::record_event("settings_gui_close_request_processed");
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -4606,7 +4605,7 @@ impl eframe::App for SettingsApp {
                     ui.horizontal(|ui| {
                         ui.add_space(12.0);
                         ui.label(
-                            RichText::new(concat!("Venu ", env!("CARGO_PKG_VERSION")))
+                            RichText::new(concat!("Nova ", env!("CARGO_PKG_VERSION")))
                                 .font(egui::FontId::monospace(10.0))
                                 .color(theme::text_tertiary()),
                         );
@@ -4615,7 +4614,7 @@ impl eframe::App for SettingsApp {
                     ui.horizontal(|ui| {
                         ui.add_space(12.0);
                         ui.label(
-                            RichText::new("Jai Shree Krishna \u{1F64F}")
+                            RichText::new("HFZRFA")
                                 .size(11.5)
                                 .italics()
                                 .color(theme::text_secondary()),
@@ -4666,7 +4665,7 @@ impl eframe::App for SettingsApp {
                     ui.painter().hline(
                         rect.x_range(),
                         rect.top() - 8.0,
-                        Stroke::new(1.0, theme::divider()),
+                        Stroke::new(1.0_f32, theme::divider()),
                     );
                     ui.add_space(4.0);
                     Self::draw_preview_bar(ui, &cfg_guard);
@@ -4805,12 +4804,12 @@ impl eframe::App for SettingsApp {
         frame.vline(
             screen.left() + SIDEBAR_WIDTH,
             screen.y_range(),
-            Stroke::new(1.0, theme::divider()),
+            Stroke::new(1.0_f32, theme::divider()),
         );
         frame.rect_stroke(
             screen.shrink(0.5),
             Rounding::same(WINDOW_ROUNDING),
-            Stroke::new(1.0, Color32::from_white_alpha(30)),
+            Stroke::new(1.0_f32, Color32::from_white_alpha(30)),
         );
 
         Self::resize_grips(ctx);
@@ -4878,7 +4877,7 @@ enum Glyph {
 }
 
 fn paint_glyph(painter: &egui::Painter, glyph: Glyph, center: egui::Pos2, color: Color32) {
-    let stroke = Stroke::new(1.4, color);
+    let stroke = Stroke::new(1.4_f32, color);
     let p = |x: f32, y: f32| center + Vec2::new(x, y);
     match glyph {
         Glyph::Search => {
@@ -4907,7 +4906,7 @@ fn paint_glyph(painter: &egui::Painter, glyph: Glyph, center: egui::Pos2, color:
 
 /// The rail's page glyphs, drawn as strokes so they follow the palette.
 fn paint_icon(painter: &egui::Painter, icon: Icon, center: egui::Pos2, color: Color32) {
-    let stroke = Stroke::new(1.35, color);
+    let stroke = Stroke::new(1.35_f32, color);
     let (cx, cy) = (center.x, center.y);
     let p = egui::pos2;
 

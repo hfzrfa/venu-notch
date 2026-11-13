@@ -1,21 +1,21 @@
 //! Per-user "launch on startup" support.
 //!
-//! Two mechanisms, picked by how Venu was installed:
+//! Two mechanisms, picked by how Nova was installed:
 //!
 //! * **Microsoft Store (MSIX) build** — Windows' own `StartupTask`, declared in
 //!   the package manifest with [`STORE_TASK_ID`]. It starts off; switching it
-//!   on asks Windows, and if the user has turned Venu off in Settings › Apps ›
-//!   Startup (or a policy has), Windows says no and Venu respects that rather
+//!   on asks Windows, and if the user has turned Nova off in Settings › Apps ›
+//!   Startup (or a policy has), Windows says no and Nova respects that rather
 //!   than finding another way in. A packaged app has no business writing the
 //!   Run key, so nothing below the next heading runs for it.
 //! * **Portable exe and Inno Setup installer** — the registry, as follows.
 //!
-//! Venu registers itself under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
+//! Nova registers itself under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
 //! so no elevation and no service is involved — the entry belongs to the
 //! signed-in user and can be turned off here, in Task Manager's Startup list,
 //! or by uninstalling.
 //!
-//! The registered command always points at the copy of `venu.exe` that last
+//! The registered command always points at the copy of `nova.exe` that last
 //! wrote the entry and carries `--startup`, which makes a sign-in launch come
 //! up quietly in the tray instead of opening the settings window over the
 //! desktop. [`crate::main`] keeps the entry refreshed on every run so an
@@ -43,7 +43,8 @@ const STARTUP_APPROVED_KEY_PATH: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 
 /// The one Run-key value this app owns.
-const VALUE_NAME: &str = "Venu";
+const VALUE_NAME: &str = "Nova";
+const LEGACY_VALUE_NAME: &str = "Venu";
 
 /// Appended to the registered command so a sign-in launch starts quietly.
 const QUIET_FLAG: &str = "--startup";
@@ -51,14 +52,15 @@ const QUIET_FLAG: &str = "--startup";
 /// The startup task's id. Must match the `TaskId` of the
 /// `windows.startupTask` extension in the Store package's AppxManifest.xml
 /// (see docs/store-packaging.md).
-pub const STORE_TASK_ID: &str = "VenuStartup";
+pub const STORE_TASK_ID: &str = "NovaStartup";
+const LEGACY_STORE_TASK_ID: &str = "VenuStartup";
 
 /// What launch-on-startup ended up as after a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupState {
     On,
     Off,
-    /// The user switched Venu off in Windows' Startup settings. Only they can
+    /// The user switched Nova off in Windows' Startup settings. Only they can
     /// switch it back on, there.
     BlockedByUser,
     /// An administrator's policy decides.
@@ -92,7 +94,7 @@ fn on_winrt_thread<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     std::thread::Builder::new()
-        .name("Venu startup task".to_owned())
+        .name("Nova startup task".to_owned())
         .spawn(move || {
             let initialized = unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok();
             let out = f();
@@ -107,9 +109,14 @@ fn on_winrt_thread<T: Send + 'static>(
 }
 
 fn store_task() -> Result<StartupTask, String> {
-    StartupTask::GetAsync(&HSTRING::from(STORE_TASK_ID))
-        .and_then(|op| op.get())
-        .map_err(|e| format!("Windows has no startup task \"{STORE_TASK_ID}\" for Venu: {e}"))
+    for id in [STORE_TASK_ID, LEGACY_STORE_TASK_ID] {
+        if let Ok(task) = StartupTask::GetAsync(&HSTRING::from(id)).and_then(|op| op.get()) {
+            return Ok(task);
+        }
+    }
+    Err(format!(
+        "Windows has no startup task \"{STORE_TASK_ID}\" for Nova"
+    ))
 }
 
 /// The Store build's startup state as Windows sees it.
@@ -273,10 +280,12 @@ fn remove_value(subkey: &str, value_name: &str) -> RegResult<()> {
     })
 }
 
-/// Whether a `Venu` entry currently exists under the Run key. Always false
+/// Whether a `Nova` entry currently exists under the Run key. Always false
 /// for the Store build, which never uses it.
 pub fn is_registered() -> bool {
-    !managed_by_windows() && value_exists(VALUE_NAME).unwrap_or(false)
+    !managed_by_windows()
+        && (value_exists(VALUE_NAME).unwrap_or(false)
+            || value_exists(LEGACY_VALUE_NAME).unwrap_or(false))
 }
 
 /// The command the autostart entry will run, if one is registered. `None`
@@ -285,7 +294,10 @@ pub fn registered_command() -> Option<String> {
     if managed_by_windows() {
         return None;
     }
-    query_value(VALUE_NAME).ok().flatten()
+    query_value(VALUE_NAME)
+        .ok()
+        .flatten()
+        .or_else(|| query_value(LEGACY_VALUE_NAME).ok().flatten())
 }
 
 /// Switch launch-on-startup on. The registry build writes the entry so
@@ -297,7 +309,11 @@ pub fn enable() -> Result<StartupState, String> {
     }
     let exe = this_exe()?;
     set_value(VALUE_NAME, &command_for(&exe))
-        .map(|()| StartupState::On)
+        .map(|()| {
+            let _ = remove_value(RUN_KEY_PATH, LEGACY_VALUE_NAME);
+            let _ = remove_value(STARTUP_APPROVED_KEY_PATH, LEGACY_VALUE_NAME);
+            StartupState::On
+        })
         .map_err(|e| format!("could not write the autostart registry entry (Win32 error {e})"))
 }
 
@@ -311,6 +327,8 @@ pub fn disable() -> Result<(), String> {
         .map_err(|e| format!("could not remove the autostart registry entry (Win32 error {e})"))?;
     // Best effort: the approval entry is Explorer bookkeeping and may not exist.
     let _ = remove_value(STARTUP_APPROVED_KEY_PATH, VALUE_NAME);
+    let _ = remove_value(RUN_KEY_PATH, LEGACY_VALUE_NAME);
+    let _ = remove_value(STARTUP_APPROVED_KEY_PATH, LEGACY_VALUE_NAME);
     Ok(())
 }
 
@@ -318,7 +336,7 @@ pub fn disable() -> Result<(), String> {
 mod tests {
     use super::*;
 
-    const TEST_VALUE: &str = "VenuTest";
+    const TEST_VALUE: &str = "NovaTest";
 
     #[test]
     fn startup_task_states_map_to_what_the_toggle_can_show() {
@@ -346,21 +364,21 @@ mod tests {
 
     #[test]
     fn command_is_quoted_and_quiet() {
-        let cmd = command_for(Path::new(r"C:\Program Files\Venu\venu.exe"));
-        assert_eq!(cmd, r#""C:\Program Files\Venu\venu.exe" --startup"#);
+        let cmd = command_for(Path::new(r"C:\Program Files\Nova\nova.exe"));
+        assert_eq!(cmd, r#""C:\Program Files\Nova\nova.exe" --startup"#);
     }
 
     #[test]
     fn registry_roundtrip_uses_a_scratch_value() {
-        // Deliberately not the real `Venu` value: the test writes, reads and
+        // Deliberately not the real `Nova` value: the test writes, reads and
         // removes a scratch entry, so running `cargo test` never flips the
         // user's actual autostart state.
-        set_value(TEST_VALUE, r#""C:\somewhere\venu.exe" --startup"#)
+        set_value(TEST_VALUE, r#""C:\somewhere\nova.exe" --startup"#)
             .expect("write under HKCU Run");
         assert!(matches!(value_exists(TEST_VALUE), Ok(true)));
         assert_eq!(
             query_value(TEST_VALUE).expect("query under HKCU Run"),
-            Some(r#""C:\somewhere\venu.exe" --startup"#.to_string())
+            Some(r#""C:\somewhere\nova.exe" --startup"#.to_string())
         );
         remove_value(RUN_KEY_PATH, TEST_VALUE).expect("remove scratch value");
         assert!(matches!(value_exists(TEST_VALUE), Ok(false)));

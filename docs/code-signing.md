@@ -1,7 +1,7 @@
 # Code signing
 
 Without a signature, Windows SmartScreen shows "Windows protected your PC"
-and lists the publisher as unknown when someone runs `venu-setup-*.exe`.
+and lists the publisher as unknown when someone runs `nova-setup-*.exe`.
 Two things change that:
 
 - **The Microsoft Store build.** Microsoft signs Store packages, so it
@@ -16,15 +16,15 @@ Two things change that:
 `.github/workflows/release.yml` signs only when signing is set up. Until then
 it builds and publishes unsigned binaries, exactly as before. When set up:
 
-1. `cargo build` builds `venu.exe`; it is uploaded as a workflow artifact and
+1. `cargo build` builds `nova.exe`; it is uploaded as a workflow artifact and
    sent to SignPath, and the signed copy replaces it.
-2. Inno Setup packs the **signed** `venu.exe` into the installer.
+2. Inno Setup packs the **signed** `nova.exe` into the installer.
 3. The installer is signed the same way, then both are published.
 
 ## One-time setup
 
 1. **Apply** for free open-source signing with the SignPath Foundation
-   (signpath.org). The project must stay open source (Venu is MIT) and be
+   (signpath.org). The project must stay open source (Nova is MIT) and be
    built by GitHub Actions from this repository, which it already is.
 2. Once approved, in SignPath:
    - install the SignPath GitHub App on this repository and add GitHub as a

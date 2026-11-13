@@ -531,33 +531,27 @@ impl Painter {
             return;
         }
 
-        let stacked = body.bottom - body.top >= geom::MEDIA_STACKED_MIN_H;
-        let aspect = if stacked {
-            self.media_art_aspect(t, &now, generation)
-        } else {
-            1.0
-        };
-        let art = geom::media_art(body, aspect);
-        let radius = if stacked { 12.0 } else { 9.0 };
+        let full_body = body;
+        let media_accent = cfg.notch.accent;
 
-        // A soft halo in the accent behind the art, so it sits in the panel
-        // rather than being pasted on it.
-        if stacked {
-            for (grow, a) in [(10.0, 0.05), (5.0, 0.08)] {
-                self.fill_rrect(
-                    t,
-                    D2D_RECT_F {
-                        left: art.left - grow,
-                        top: art.top - grow * 0.6,
-                        right: art.right + grow,
-                        bottom: art.bottom + grow,
-                    },
-                    radius + grow,
-                    theme::fade(cfg.notch.accent, alpha * a),
-                );
-            }
-        }
-        let drawn = self.fill_media_art(t, &now, art, radius, alpha, generation);
+        // Do not rearrange the player while a lookup is still speculative.
+        // Split only after lyrics were verified, avoiding the flash of an
+        // empty column on every track change or a failed lookup.
+        let regions =
+            geom::media_regions(full_body, cfg.notch.media.lyrics && now.lyrics.is_some());
+        let lyrics_body = regions.lyrics;
+        let body = regions.player;
+
+        let stacked = body.bottom - body.top >= geom::MEDIA_STACKED_MIN_H;
+        let art = geom::media_art(body, 1.0);
+        let radius = (art.right - art.left).min(art.bottom - art.top) * 0.5;
+        let rotation = if now.playing && now.art.is_some() {
+            self.report(crate::notch::paint::Motion::Ambient);
+            (state.elapsed * 18.0).rem_euclid(360.0)
+        } else {
+            0.0
+        };
+        let drawn = self.fill_media_art(t, &now, art, radius, alpha, generation, rotation);
         if !drawn {
             self.fill_rrect(t, art, radius, theme::fade(self.pal.well, alpha * 2.0));
             let side = (art.right - art.left).min(art.bottom - art.top);
@@ -587,6 +581,8 @@ impl Painter {
         let source = now.source.trim();
 
         let column = geom::media_text_column(body);
+        let body_h = body.bottom - body.top;
+        let column_w = column.right - column.left;
         let [prev, _, _] = geom::media_transport_buttons(body);
         let buttons_top = prev.1 - 15.0;
 
@@ -626,12 +622,12 @@ impl Painter {
             let inset = ((column.right - column.left) * 0.12).min(56.0);
             self.paint_timeline(
                 t,
-                cfg,
                 &now,
                 column.left + inset,
                 column.right - inset,
                 line_y,
                 alpha,
+                media_accent,
             );
         } else {
             let mut y = column.top + 2.0;
@@ -647,7 +643,7 @@ impl Painter {
                 y,
                 theme::fade(self.pal.text_hi, alpha),
             );
-            if !byline.is_empty() {
+            if !byline.is_empty() && body_h >= 100.0 && column_w >= 72.0 {
                 y += 2.0
                     + self.label(
                         t,
@@ -662,7 +658,7 @@ impl Painter {
                         theme::fade(self.pal.text_mid, alpha),
                     );
             }
-            if !source.is_empty() {
+            if !source.is_empty() && body_h >= 128.0 && column_w >= 88.0 {
                 self.label(
                     t,
                     family,
@@ -676,48 +672,141 @@ impl Painter {
                     theme::fade(self.pal.text_lo, alpha),
                 );
             }
-            self.paint_timeline(
-                t,
-                cfg,
-                &now,
-                column.left,
-                column.right,
-                buttons_top - 12.0,
-                alpha,
-            );
+            if body_h >= 105.0 && column_w >= 105.0 {
+                self.paint_timeline(
+                    t,
+                    &now,
+                    column.left,
+                    column.right,
+                    buttons_top - 12.0,
+                    alpha,
+                    media_accent,
+                );
+            }
         }
 
-        self.paint_media_controls(t, factory, cfg, body, now.playing, alpha);
+        self.paint_media_controls(t, factory, body, now.playing, alpha, media_accent);
+        if let Some(lyrics_body) = lyrics_body {
+            self.paint_lyrics_column(t, cfg, &now, lyrics_body, alpha);
+        }
     }
 
-    /// The art's width over its height, from the decoded bitmap. A 4:3
-    /// thumbnail is how YouTube letterboxes a 16:9 video, so it is shown as
-    /// 16:9 and the black bars are cropped away.
-    fn media_art_aspect(
-        &mut self,
+    fn paint_lyrics_column(
+        &self,
         t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
         now: &crate::notch::media::NowPlaying,
-        generation: u64,
-    ) -> f32 {
-        if now.art.is_none() {
-            return 1.0;
-        }
-        // Decoding is cached; drawing it at zero size primes the cache.
-        let probe = D2D_RECT_F::default();
-        let _ = self.fill_media_art(t, now, probe, 0.0, 0.0, generation);
-        let Some(cached) = &self.media_art else {
-            return 1.0;
-        };
-        let size = unsafe { cached.bitmap.GetSize() };
-        if size.width <= 0.0 || size.height <= 0.0 {
-            return 1.0;
-        }
-        let aspect = size.width / size.height;
-        if aspect > 1.2 {
-            16.0 / 9.0
+        body: D2D_RECT_F,
+        alpha: f32,
+    ) {
+        let family = &cfg.notch.font_family;
+        let width = (body.right - body.left).max(1.0);
+        let height = (body.bottom - body.top).max(1.0);
+        let lyrics_below_player = width > height * 2.5;
+        if lyrics_below_player {
+            self.line(
+                t,
+                body.left,
+                body.top - 5.0,
+                body.right,
+                body.top - 5.0,
+                1.0,
+                theme::fade(self.pal.rule, alpha * 0.65),
+            );
         } else {
-            1.0
+            self.line(
+                t,
+                body.left - 9.0,
+                body.top,
+                body.left - 9.0,
+                body.bottom,
+                1.0,
+                theme::fade(self.pal.rule, alpha * 0.65),
+            );
         }
+        if now.lyrics_loading {
+            self.paragraph(
+                t,
+                family,
+                "Finding lyrics…",
+                13.0,
+                body.right - body.left,
+                body.left,
+                (body.top + body.bottom) * 0.5 - 8.0,
+                theme::fade(self.pal.text_lo, alpha),
+            );
+            return;
+        }
+        let Some(lyrics) = now.lyrics.as_deref() else {
+            return;
+        };
+        let active = lyrics
+            .current_index_with_duration(now.position_now(), now.duration_secs)
+            .unwrap_or(0);
+        let count = if lyrics.synced.is_empty() {
+            lyrics.plain.len()
+        } else {
+            lyrics.synced.len()
+        };
+        let compact = width < 220.0 || height < 105.0;
+        let start = if compact {
+            active
+        } else {
+            active.saturating_sub(1)
+        };
+        let end = (start + if compact { 2 } else { 4 }).min(count);
+        let mut y = body.top + 3.0;
+        self.clip(t, body);
+        for index in start..end {
+            let Some(line) = lyrics.line(index) else {
+                continue;
+            };
+            let current = index == active;
+            let size = if current {
+                if compact {
+                    13.5
+                } else {
+                    16.0
+                }
+            } else if compact {
+                11.0
+            } else {
+                13.0
+            };
+            let remaining = body.bottom - y;
+            if remaining < size {
+                break;
+            }
+            let Ok(fmt) = self.text.format(family, size, DWRITE_FONT_WEIGHT_SEMI_BOLD) else {
+                continue;
+            };
+            TextEngine::set_wrapping(
+                &fmt,
+                windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_WRAP,
+            );
+            self.text.set_ellipsis(&fmt);
+            let max_h = remaining.min(size * if current { 3.4 } else { 2.5 });
+            let Ok(layout) = self.text.layout(line, &fmt, width, max_h) else {
+                continue;
+            };
+            let (_, measured_h) = TextEngine::measure(&layout);
+            self.draw_layout(
+                t,
+                &layout,
+                body.left,
+                y,
+                theme::fade(
+                    if current {
+                        self.pal.text_hi
+                    } else {
+                        self.pal.text_lo
+                    },
+                    alpha * if current { 1.0 } else { 0.55 },
+                ),
+            );
+            y += measured_h.max(size) + if compact { 4.0 } else { 8.0 };
+        }
+        self.unclip(t);
     }
 
     /// Elapsed time, a thin progress line, total time. Nothing when the app
@@ -726,12 +815,12 @@ impl Painter {
     fn paint_timeline(
         &self,
         t: &ID2D1DCRenderTarget,
-        cfg: &AppConfig,
         now: &crate::notch::media::NowPlaying,
         left: f32,
         right: f32,
         cy: f32,
         alpha: f32,
+        accent: theme::Rgba,
     ) {
         if now.duration_secs <= 0.0 || right - left < 80.0 {
             return;
@@ -773,20 +862,14 @@ impl Painter {
             ..track
         };
         if filled.right > filled.left + 1.0 {
-            self.fill_rrect(t, filled, 1.5, theme::fade(cfg.notch.accent, alpha));
-            self.dot(
-                t,
-                filled.right,
-                cy,
-                3.5,
-                theme::fade(self.pal.text_hi, alpha),
-            );
+            self.fill_rrect(t, filled, 1.5, theme::fade(accent, alpha));
+            self.dot(t, filled.right, cy, 3.5, theme::fade(accent, alpha));
         }
     }
 
     /// One line centred across `area`, top at `y`. Returns its height.
     #[allow(clippy::too_many_arguments)]
-    fn centred_label(
+    pub(super) fn centred_label(
         &self,
         t: &ID2D1DCRenderTarget,
         family: &str,
@@ -848,7 +931,7 @@ impl Painter {
             self.centred_label(
                 t,
                 family,
-                "Or add them in Settings \u{203A} Slides \u{203A} Shelf. Venu keeps the path, never a copy.",
+                "Or add them in Settings \u{203A} Slides \u{203A} Shelf. Nova keeps the path, never a copy.",
                 11.0,
                 DWRITE_FONT_WEIGHT_MEDIUM,
                 body,
@@ -1031,7 +1114,10 @@ impl Painter {
             return;
         }
 
-        let items = clipboard::items();
+        let mut items = clipboard::items();
+        if let Some((width, height)) = clipboard::latest_image() {
+            items.push(format!("Screenshot image  ·  {width} × {height}"));
+        }
         self.label(
             t,
             family,
@@ -1049,7 +1135,7 @@ impl Painter {
             self.centred_label(
                 t,
                 family,
-                "Copy some text and it shows up here. Click a row to copy it again.",
+                "Copy text or take a screenshot and it shows up here.",
                 12.0,
                 DWRITE_FONT_WEIGHT_MEDIUM,
                 body,

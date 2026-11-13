@@ -1,6 +1,6 @@
 //! The Calendar slide's events, read from an iCal feed.
 //!
-//! Windows only lets packaged apps read the system calendar, so Venu reads
+//! Windows only lets packaged apps read the system calendar, so Nova reads
 //! the same thing every calendar service can publish instead: an `.ics`
 //! address (Google Calendar's "secret address in iCal format", Outlook's
 //! "publish calendar" ICS link) or a local `.ics` file.
@@ -59,6 +59,8 @@ static REVISION: AtomicU64 = AtomicU64::new(0);
 /// The source the fetch thread should read, and a nudge to read it now.
 struct Wanted {
     source: String,
+    api_key: String,
+    calendar_id: String,
     refresh: Duration,
     changed: bool,
 }
@@ -67,12 +69,14 @@ fn wanted() -> &'static (Mutex<Wanted>, Condvar) {
     static WANTED: OnceLock<(Mutex<Wanted>, Condvar)> = OnceLock::new();
     WANTED.get_or_init(|| {
         std::thread::Builder::new()
-            .name("venu-calendar".into())
+            .name("nova-calendar".into())
             .spawn(fetch_loop)
             .ok();
         (
             Mutex::new(Wanted {
                 source: String::new(),
+                api_key: String::new(),
+                calendar_id: String::new(),
                 refresh: Duration::from_secs(15 * 60),
                 changed: false,
             }),
@@ -84,19 +88,30 @@ fn wanted() -> &'static (Mutex<Wanted>, Condvar) {
 /// Tell the fetcher what to read. Called every tick; does nothing unless the
 /// source or interval changed. The thread is only started the first time a
 /// source is set, so a user who never uses the calendar never pays for it.
-pub fn configure(source: &str, refresh_mins: u32) {
-    static LAST: Mutex<Option<(String, u32)>> = Mutex::new(None);
+pub fn configure(source: &str, api_key: &str, calendar_id: &str, refresh_mins: u32) {
+    static LAST: Mutex<Option<(String, String, String, u32)>> = Mutex::new(None);
     let mut last = LAST.lock();
-    if last.as_ref().map(|(s, r)| (s.as_str(), *r)) == Some((source, refresh_mins)) {
+    let desired = (
+        source.trim().to_owned(),
+        api_key.trim().to_owned(),
+        calendar_id.trim().to_owned(),
+        refresh_mins,
+    );
+    if last.as_ref() == Some(&desired) {
         return;
     }
-    *last = Some((source.to_owned(), refresh_mins));
-    if source.trim().is_empty() && SHARED.read().status == Status::Unset {
+    *last = Some(desired.clone());
+    if desired.0.is_empty()
+        && (desired.1.is_empty() || desired.2.is_empty())
+        && SHARED.read().status == Status::Unset
+    {
         return;
     }
     let (lock, cv) = wanted();
     let mut w = lock.lock();
-    w.source = source.trim().to_owned();
+    w.source = desired.0;
+    w.api_key = desired.1;
+    w.calendar_id = desired.2;
     w.refresh = Duration::from_secs(refresh_mins.clamp(5, 24 * 60) as u64 * 60);
     w.changed = true;
     cv.notify_one();
@@ -148,23 +163,30 @@ fn fetch_loop() {
     }
     let (lock, cv) = wanted();
     loop {
-        let (source, refresh) = {
+        let (source, api_key, calendar_id, refresh) = {
             let mut w = lock.lock();
             w.changed = false;
-            (w.source.clone(), w.refresh)
+            (
+                w.source.clone(),
+                w.api_key.clone(),
+                w.calendar_id.clone(),
+                w.refresh,
+            )
         };
 
-        if source.is_empty() {
+        if source.is_empty() && (api_key.is_empty() || calendar_id.is_empty()) {
             publish(Some(Vec::new()), Status::Unset);
         } else {
             if SHARED.read().events.is_empty() {
                 publish(None, Status::Loading);
             }
-            match read_source(&source) {
-                Ok(text) => {
-                    let events = parse(&text, now_local());
-                    publish(Some(events), Status::Ready);
-                }
+            let result = if !api_key.is_empty() && !calendar_id.is_empty() {
+                read_google_calendar(&api_key, &calendar_id)
+            } else {
+                read_source(&source).map(|text| parse(&text, now_local()))
+            };
+            match result {
+                Ok(events) => publish(Some(events), Status::Ready),
                 // Keep showing the last good events through a blip.
                 Err(e) => publish(None, Status::Failed(e)),
             }
@@ -188,7 +210,18 @@ fn read_source(source: &str) -> Result<String, String> {
         } else {
             source.to_owned()
         };
-        fetch(&url).map_err(|e| format!("Could not download the calendar ({})", e.message()))
+        fetch(&url).map_err(|e| {
+            let message = e.message();
+            if message.contains("404")
+                && lower.contains("calendar.google.com")
+                && lower.contains("/public/basic.ics")
+            {
+                "Google returned 404: this public iCal link only works when the calendar is shared publicly. For a private calendar, copy its ‘Secret address in iCal format’ from Google Calendar settings."
+                    .to_owned()
+            } else {
+                format!("Could not download the calendar ({message})")
+            }
+        })
     } else {
         std::fs::read_to_string(source).map_err(|e| format!("Could not open the file ({e})"))
     }
@@ -203,6 +236,114 @@ fn fetch(url: &str) -> windows::core::Result<String> {
     let uri = Uri::CreateUri(&HSTRING::from(url))?;
     let text = client.GetStringAsync(&uri)?.get()?;
     Ok(text.to_string_lossy())
+}
+
+#[derive(serde::Deserialize)]
+struct GoogleEvents {
+    #[serde(default)]
+    items: Vec<GoogleEvent>,
+}
+
+#[derive(serde::Deserialize)]
+struct GoogleEvent {
+    #[serde(default)]
+    status: String,
+    summary: Option<String>,
+    location: Option<String>,
+    start: GoogleEventTime,
+    end: GoogleEventTime,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleEventTime {
+    date_time: Option<String>,
+    date: Option<String>,
+}
+
+/// Read expanded occurrences from the official Google Calendar Events API.
+/// API-key authentication is intentionally limited to public calendars;
+/// private calendars continue to use the secret iCal URL and need no OAuth UI.
+fn read_google_calendar(api_key: &str, calendar_id: &str) -> Result<Vec<Event>, String> {
+    let utc = unsafe { GetSystemTime() };
+    let time_min = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond
+    );
+    let url = format!(
+        "https://www.googleapis.com/calendar/v3/calendars/{}/events?key={}&singleEvents=true&orderBy=startTime&maxResults=50&timeMin={}",
+        url_encode(calendar_id),
+        url_encode(api_key),
+        url_encode(&time_min),
+    );
+    let text = fetch(&url).map_err(|e| format!("Google Calendar API failed ({})", e.message()))?;
+    let response: GoogleEvents = serde_json::from_str(&text)
+        .map_err(|e| format!("Google Calendar returned invalid data ({e})"))?;
+    let local_offset = utc_offset();
+    let mut events = response
+        .items
+        .into_iter()
+        .filter(|event| !event.status.eq_ignore_ascii_case("cancelled"))
+        .filter_map(|event| {
+            let (start, all_day) = parse_google_time(&event.start, local_offset)?;
+            let (end, _) = parse_google_time(&event.end, local_offset)?;
+            Some(Event {
+                start,
+                end: end.max(start + i64::from(!all_day)),
+                all_day,
+                title: event.summary.unwrap_or_else(|| "(No title)".to_owned()),
+                location: event.location.unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| (event.start, event.end));
+    Ok(events)
+}
+
+fn parse_google_time(value: &GoogleEventTime, local_offset: i64) -> Option<(i64, bool)> {
+    if let Some(date) = value.date.as_deref() {
+        let day = parse_iso_date(date)?;
+        return Some((day * 1440, true));
+    }
+    let value = value.date_time.as_deref()?;
+    let day = parse_iso_date(value.get(..10)?)?;
+    let hour = value.get(11..13)?.parse::<i64>().ok()?;
+    let minute = value.get(14..16)?.parse::<i64>().ok()?;
+    let zone = if value.ends_with('Z') {
+        0
+    } else {
+        let sign_at = value.get(19..)?.find(['+', '-'])? + 19;
+        let sign = if value.as_bytes().get(sign_at) == Some(&b'-') {
+            -1
+        } else {
+            1
+        };
+        let zone_hour = value.get(sign_at + 1..sign_at + 3)?.parse::<i64>().ok()?;
+        let zone_minute = value.get(sign_at + 4..sign_at + 6)?.parse::<i64>().ok()?;
+        sign * (zone_hour * 60 + zone_minute)
+    };
+    Some((day * 1440 + hour * 60 + minute - zone + local_offset, false))
+}
+
+fn parse_iso_date(value: &str) -> Option<i64> {
+    Some(days_from_civil(
+        value.get(0..4)?.parse().ok()?,
+        value.get(5..7)?.parse().ok()?,
+        value.get(8..10)?.parse().ok()?,
+    ))
+}
+
+fn url_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
 }
 
 // -- time ------------------------------------------------------------------
@@ -576,6 +717,28 @@ mod tests {
         assert_eq!(parse_duration("PT1H30M"), Some(90));
         assert_eq!(parse_duration("P1D"), Some(1440));
         assert_eq!(parse_duration("-PT15M"), Some(-15));
+    }
+
+    #[test]
+    fn google_event_times_are_converted_to_local_minutes() {
+        let timed = GoogleEventTime {
+            date_time: Some("2026-11-13T23:10:00+07:00".to_owned()),
+            date: None,
+        };
+        let local = parse_google_time(&timed, 7 * 60).unwrap();
+        assert_eq!(
+            local,
+            (days_from_civil(2026, 11, 13) * 1440 + 23 * 60 + 10, false)
+        );
+
+        let all_day = GoogleEventTime {
+            date_time: None,
+            date: Some("2026-11-14".to_owned()),
+        };
+        assert_eq!(
+            parse_google_time(&all_day, 7 * 60),
+            Some((days_from_civil(2026, 11, 14) * 1440, true))
+        );
     }
 
     #[test]

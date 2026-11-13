@@ -1,17 +1,21 @@
 [package]
-name = "venu"
+name = "nova"
 version = "0.6.1"
 edition = "2021"
 description = "A sleek, hardware-accelerated Dynamic Notch for Windows with live background blur, media controls, multi-glass finishes, and desktop notifications."
 license = "MIT"
 
 [dependencies]
-eframe = "0.29"
-egui = "0.29"
+# Nova supplies its own fonts and only ships on Windows. Avoid eframe's
+# cross-platform/default-font bundle while keeping the lightweight Glow
+# renderer and accessibility support used by the Settings window.
+eframe = { version = "0.29", default-features = false, features = ["accesskit", "glow"] }
+egui = { version = "0.29", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dirs = "5.0"
 parking_lot = "0.12"
+windows-core = "0.58"
 
 # Only used by the settings window, to build the wallpaper framing preview.
 # The notch itself decodes through WIC.
@@ -29,6 +33,7 @@ features = [
     "Foundation",
     "Foundation_Collections",
     "Foundation_Numerics",
+    "Devices_Geolocation",
     "ApplicationModel",
     "UI_Notifications",
     "UI_Notifications_Management",
@@ -41,6 +46,7 @@ features = [
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
     "Web_Http",
+    "Web_Http_Headers",
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
@@ -49,6 +55,8 @@ features = [
     "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
     "Win32_System_Performance",
@@ -64,11 +72,12 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_UI_Controls",
     "Win32_UI_Controls_Dialogs",
 ]
 
 [build-dependencies]
-# Embeds the version resource and app icon into venu.exe, so Explorer, the
+# Embeds the version resource and app icon into nova.exe, so Explorer, the
 # Start Menu and the installer can all see what they are looking at.
 winresource = "0.1"

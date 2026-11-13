@@ -26,7 +26,7 @@ use crate::notch::backdrop;
 
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
-const CLASS_NAME: &str = "VenuFlashClass";
+const CLASS_NAME: &str = "NovaFlashClass";
 
 pub struct FlashWindow {
     hwnd: HWND,
@@ -70,7 +70,7 @@ impl FlashWindow {
             CreateWindowExW(
                 Self::ex_style(cfg),
                 PCWSTR(HSTRING::from(CLASS_NAME).as_ptr()),
-                PCWSTR(HSTRING::from("VenuFlash").as_ptr()),
+                PCWSTR(HSTRING::from("NovaFlash").as_ptr()),
                 WS_POPUP,
                 0,
                 0,

@@ -23,7 +23,7 @@ pub fn record_eframe_error(error: &eframe::Error) {
         eframe::Error::WinitEventLoop(_) => "event_loop",
         _ => "graphics_or_runtime",
     };
-    if cfg!(debug_assertions) && std::env::var_os("VENU_STARTUP_SMOKE").is_some() {
+    if cfg!(debug_assertions) && std::env::var_os("NOVA_STARTUP_SMOKE").is_some() {
         let detail = sanitize_diagnostic(&error.to_string());
         write_record(&format!("eframe_error kind={kind} detail={detail}"));
     } else {
@@ -64,7 +64,7 @@ fn write_record(event: &str) {
     let Some(local_data) = local_data_directory() else {
         return;
     };
-    let path = local_data.join("Venu").join("startup.log");
+    let path = local_data.join("Nova").join("startup.log");
     let lock = LOG_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 

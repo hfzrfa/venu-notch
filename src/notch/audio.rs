@@ -131,10 +131,10 @@ pub fn shape(level: f32, clock: f32) -> [f32; BARS] {
     bars
 }
 
-/// Bars quantised for the frame key: a change smaller than a pixel at any
-/// size the bars are drawn is not worth a repaint.
+/// Bars quantised finely enough that a high-refresh display never exposes
+/// visible level steps. The key still avoids repaints for sub-pixel noise.
 pub fn key(bars: &[f32; BARS]) -> [u8; BARS] {
-    bars.map(|b| (b.clamp(0.0, 1.0) * 40.0) as u8)
+    bars.map(|b| (b.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
 #[cfg(test)]

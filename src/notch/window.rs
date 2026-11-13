@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetDC, GetMonitorInfoW, ReleaseDC, AC_SRC_ALPHA, AC_SRC_OVER,
     BLENDFUNCTION, HDC, HMONITOR, MONITORINFO,
@@ -52,8 +53,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{
-    AppConfig, BorderEffectConfig, InputConfig, MediaConfig, MouseTrigger, NotchAlign, NotchTheme,
-    SlideKind,
+    AppConfig, BorderEffectConfig, InputConfig, MouseTrigger, NotchAlign, NotchTheme, SlideKind,
 };
 use crate::notch::anim::{lerp, smoothstep};
 use crate::notch::audio::{self, AudioMeter};
@@ -67,7 +67,7 @@ use crate::notch::state::{Badge, NotchState};
 use crate::notch::surface::D2DSurface;
 use crate::notch::theme;
 
-const CLASS_NAME: &str = "VenuNotchClass";
+const CLASS_NAME: &str = "NovaNotchClass";
 
 /// A Direct2D rectangle as the layout module's own.
 fn layout_rect(r: windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F) -> layout::Rect {
@@ -88,13 +88,16 @@ const HOVER_SLOP: f32 = 4.0;
 /// from sixty, at a sixth of the cost. The overlay thread polls faster than
 /// this while idle, so the real cadence is the next poll after the interval
 /// rather than the interval exactly.
-const AMBIENT_FRAME: Duration = Duration::from_millis(90);
+/// Slow artwork rotation, pulses and glass sampling still need fluid visual
+/// cadence. They are capped at 60 FPS while interactive springs can follow
+/// the monitor through DWM pacing.
+const AMBIENT_FRAME: Duration = Duration::from_millis(16);
 
 /// How often the monitor layout is re-read.
 ///
 /// `EnumDisplayMonitors` is a syscall per display and a monitor arriving or
 /// leaving is not a per-frame event — but it does have to be picked up
-/// without restarting Venu, so it is polled rather than cached forever.
+/// without restarting Nova, so it is polled rather than cached forever.
 const MONITOR_REFRESH: Duration = Duration::from_secs(2);
 
 /// How often the notch re-asserts its place in the z-order while it is idle.
@@ -292,6 +295,11 @@ fn slide_collapsed_size(cfg: &AppConfig, slide: SlideKind) -> (f32, f32) {
     let base_h = cfg.notch.collapsed_height as f32;
 
     match slide {
+        SlideKind::Clock
+            if crate::notch::prayer::upcoming_within(&cfg.notch.prayer, 10).is_some() =>
+        {
+            (base_w.max(300.0), base_h)
+        }
         SlideKind::Marquee => (
             override_or(cfg.marquee.collapsed_width, base_w, 40.0),
             override_or(cfg.marquee.collapsed_height, base_h, 16.0),
@@ -299,8 +307,9 @@ fn slide_collapsed_size(cfg: &AppConfig, slide: SlideKind) -> (f32, f32) {
         // Three metrics need enough room to breathe even when the ordinary
         // collapsed pill is configured for a clock or a short status line.
         SlideKind::Stats => (base_w.max(260.0), base_h.max(30.0)),
-        // Room for the wave, the title and three music controls.
-        SlideKind::Media => (base_w.max(300.0), base_h),
+        // The live lyric adjusts this width in `current_shape`; without a
+        // session the Media face is the same compact clock as Clock itself.
+        SlideKind::Media => (base_w, base_h),
         _ => (base_w, base_h),
     }
 }
@@ -317,6 +326,9 @@ fn slide_expanded_size(cfg: &AppConfig, slide: SlideKind) -> (f32, f32) {
     let base_h = (cfg.notch.expanded_height as f32).max(min_h);
 
     match slide {
+        SlideKind::Clock if cfg.notch.prayer.enabled && cfg.notch.prayer.show_on_clock => {
+            (base_w.max(480.0), base_h.max(190.0))
+        }
         SlideKind::Wallpaper => (
             override_or(cfg.wallpaper.panel_width, base_w, min_w),
             override_or(cfg.wallpaper.panel_height, base_h, min_h),
@@ -332,16 +344,11 @@ fn slide_expanded_size(cfg: &AppConfig, slide: SlideKind) -> (f32, f32) {
         // The player is centred and stacked: narrower and taller than the
         // other pages unless the user sized it themselves.
         SlideKind::Media => (
-            override_or(
-                cfg.notch.media.panel_width,
-                MediaConfig::AUTO_WIDTH.max(min_w),
-                min_w,
-            ),
-            override_or(
-                cfg.notch.media.panel_height,
-                MediaConfig::AUTO_HEIGHT.max(min_h),
-                min_h,
-            ),
+            // A zero per-media override means inherit the global Expanded
+            // controls. Previously it jumped to AUTO_WIDTH/AUTO_HEIGHT,
+            // making the visible Settings sliders appear broken on Media.
+            override_or(cfg.notch.media.panel_width, base_w, min_w),
+            override_or(cfg.notch.media.panel_height, base_h, min_h),
         ),
         _ => (base_w, base_h),
     }
@@ -425,7 +432,7 @@ struct FrameKey {
     /// Hover highlight and click ripple in the panel.
     feedback: (Option<Hit>, i32, Option<(Hit, i32)>),
     /// The menu card's motion and highlight.
-    menu: Option<[i32; 6]>,
+    menu: Option<[i32; 7]>,
 }
 
 /// What one frame of the notch asked for.
@@ -495,6 +502,9 @@ pub struct NotchWindow {
     modal_keys: [bool; 4],
     /// The live music wave.
     audio: AudioMeter,
+    /// True between pressing and releasing the media progress track.
+    media_scrubbing: bool,
+    last_media_seek: Instant,
 }
 
 unsafe impl Send for NotchWindow {}
@@ -528,7 +538,7 @@ impl NotchWindow {
 
         let hwnd = unsafe {
             let name = HSTRING::from(CLASS_NAME);
-            let title = HSTRING::from("Venu Notch");
+            let title = HSTRING::from("Nova Notch");
             CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(ex_style),
                 PCWSTR(name.as_ptr()),
@@ -585,6 +595,8 @@ impl NotchWindow {
             hotkeys: [None; 3],
             modal_keys: [false; 4],
             audio: AudioMeter::default(),
+            media_scrubbing: false,
+            last_media_seek: Instant::now() - Duration::from_secs(1),
         })
     }
 
@@ -640,6 +652,12 @@ impl NotchWindow {
             let (cw, ch) = slide_collapsed_size(cfg, slide);
             expanded_w = expanded_w.max(w).max(cw);
             expanded_h = expanded_h.max(h).max(ch);
+            if slide == SlideKind::Media {
+                // The visible window is still trimmed to the current lyric;
+                // reserve the maximum only in the reusable backing surface so
+                // a long line cannot be clipped when it arrives.
+                expanded_w = expanded_w.max(crate::notch::media::MAX_STANDBY_WIDTH);
+            }
         }
         // The resting pill can be wider than any one slide asks for: split
         // segments add to it, and pods sit out beside it. Reserve that once,
@@ -708,11 +726,21 @@ impl NotchWindow {
     }
 
     /// The silhouette for the current expansion, in window-local coordinates.
-    fn current_shape(&self, cfg: &AppConfig) -> NotchShape {
+    fn current_shape(&mut self, cfg: &AppConfig) -> NotchShape {
         let t = self.state.expand.value.clamp(0.0, 1.0);
 
         let (open_w, open_h) = self.blended_size(cfg, slide_expanded_size);
-        let (shut_w, shut_h) = self.blended_size(cfg, slide_collapsed_size);
+        let (mut shut_w, shut_h) = self.blended_size(cfg, slide_collapsed_size);
+
+        // Measure the exact lyric/title string and font. Short lines no longer
+        // leave guessed space at the right; long metadata expands before the
+        // painter ever needs its maximum-width ellipsis.
+        let slides = cfg.notch.effective_slides();
+        if slides.get(self.state.active) == Some(&SlideKind::Media) {
+            if let Some(responsive) = self.painter.media_standby_width(cfg) {
+                shut_w = responsive;
+            }
+        }
 
         // Split segments widen the resting pill either side of its face, and
         // the panel never opens narrower than the pill it grows out of.
@@ -721,15 +749,34 @@ impl NotchWindow {
         let open_w = open_w.max(shut_w);
 
         let tp = self.state.toast_progress.value.clamp(0.0, 1.0);
-        let toast_w = 380.0;
+        let toast_w = crate::notch::notify::global_store()
+            .read()
+            .active_toast
+            .as_ref()
+            .map(|toast| {
+                let n = &toast.notification;
+                let chars =
+                    n.app.chars().count() + n.title.chars().count() + n.body.chars().count();
+                (176.0 + chars.min(54) as f32 * 5.2).clamp(240.0, 460.0)
+            })
+            .unwrap_or(300.0);
         let toast_h = 44.0;
         let base_w = lerp(shut_w, toast_w, tp);
         let base_h = lerp(shut_h, toast_h, tp);
 
-        // The closed pill grows a touch under the cursor (see `peek`).
-        let peek = self.state.peek.value.clamp(0.0, 1.2) * (1.0 - t);
-        let base_w = base_w + PEEK_GROW_W * peek;
-        let base_h = base_h + PEEK_GROW_H * peek;
+        // Optional near-hidden top-edge handle. Its painted line is tiny, but
+        // hit testing adds HOVER_SLOP around it so it remains easy to reveal.
+        // The peek spring restores the complete standby pill before the
+        // configured hover gesture opens the panel.
+        let peek = self.state.peek.value.clamp(0.0, 1.0) * (1.0 - t);
+        let (base_w, base_h) = if cfg.notch.minimize_when_idle && tp < 0.01 && t < 0.01 {
+            (
+                lerp(base_w.min(42.0), base_w, peek),
+                lerp(3.0, base_h, peek),
+            )
+        } else {
+            (base_w + PEEK_GROW_W * peek, base_h + PEEK_GROW_H * peek)
+        };
 
         let w = lerp(base_w, open_w, t);
         let h = lerp(base_h, open_h, t);
@@ -1178,7 +1225,7 @@ impl NotchWindow {
         rows.push(MenuRow::Separator);
         rows.push(MenuRow::danger(
             MenuCommand::Quit,
-            "Quit Venu",
+            "Quit Nova",
             glyph::POWER,
         ));
         rows
@@ -1314,8 +1361,14 @@ impl NotchWindow {
         let toast_secs = cfg.notch.notifications.toast_duration_secs;
         crate::notch::timer::tick(&cfg.notch.timer, toast_secs);
         crate::notch::battery::tick(&cfg.notch.battery, toast_secs);
+        crate::notch::prayer::tick(&cfg.notch.prayer, toast_secs);
+        self.painter
+            .media
+            .set_lyrics_enabled(cfg.notch.media.lyrics);
         crate::notch::calendar::configure(
             &cfg.notch.calendar.source,
+            &cfg.notch.calendar.google_api_key,
+            &cfg.notch.calendar.google_calendar_id,
             cfg.notch.calendar.refresh_mins,
         );
 
@@ -1437,12 +1490,19 @@ impl NotchWindow {
             .hover_delay_ms
             .min(InputConfig::MAX_HOVER_DELAY_MS) as f32
             / 1000.0;
-        if on_target && hover_ok && !self.state.open_target && speed < FLYBY_SPEED {
+        // Ultra-minimise is deliberately a two-stage interaction: first the
+        // tiny handle grows back into the complete standby pill, only then
+        // does the ordinary hover delay begin opening the panel. Previously
+        // both timers ran together, so a slow reveal could jump straight
+        // from the 3px handle into the large panel.
+        let pill_revealed = !cfg.notch.minimize_when_idle || self.state.peek.value >= 0.97;
+        if on_target && hover_ok && !self.state.open_target && pill_revealed && speed < FLYBY_SPEED
+        {
             self.state.dwell += dt;
         } else {
             self.state.dwell = 0.0;
         }
-        let hover_opens = hover_ok && on_target && self.state.dwell >= delay;
+        let hover_opens = hover_ok && on_target && pill_revealed && self.state.dwell >= delay;
         // A click-opened panel stays until the cursor has been on it and
         // left (when leaving closes it), so a shortcut can open it from
         // anywhere without it closing at once.
@@ -1599,6 +1659,16 @@ impl NotchWindow {
             }
         }
 
+        if self.media_scrubbing {
+            if hook::button_held() {
+                if let Some((x, _)) = cursor {
+                    self.seek_media_at(cfg, shape, x, false);
+                }
+            } else {
+                self.media_scrubbing = false;
+            }
+        }
+
         if let Some((sx, sy)) = hook::take_menu() {
             let (cx, cy) = (
                 (sx - self.placement.x) as f32,
@@ -1648,11 +1718,7 @@ impl NotchWindow {
         } else if self.state.expand.value > 0.85 {
             cursor.and_then(|(x, y)| self.target_at(cfg, shape, x, y))
         } else {
-            cursor.and_then(|(x, y)| {
-                self.pill_targets(cfg, shape, &scene)
-                    .into_iter()
-                    .find(|t| t.contains(x, y))
-            })
+            None
         };
         let hand = self.state.hot.is_some() || self.menu.as_ref().is_some_and(|m| m.hot.is_some());
 
@@ -1764,7 +1830,11 @@ impl NotchWindow {
         let shelf_in_deck = cfg.notch.effective_slides().contains(&SlideKind::Shelf);
         let shelf_shown = self.slide_shows(cfg, SlideKind::Shelf).1;
         crate::notch::shelf::sync(&cfg.notch.shelf, shelf_in_deck, shelf_shown);
-        crate::notch::clipboard::sync(cfg.notch.clipboard.enabled, cfg.notch.clipboard.max_items);
+        crate::notch::clipboard::sync(
+            cfg.notch.clipboard.enabled,
+            cfg.notch.clipboard.max_items,
+            cfg.notch.clipboard.images,
+        );
         self.sync_hotkeys(cfg);
         self.sync_modal_keys(cfg);
 
@@ -1812,7 +1882,7 @@ impl NotchWindow {
             // A frame that differed from the one before it means something is
             // still in flight — a spring, the marquee, a countdown — and the
             // next one should not be kept waiting.
-            animating: changed || self.last_motion == Motion::Continuous,
+            animating: changed || self.last_motion != Motion::Still,
             open_settings: std::mem::take(&mut self.open_settings),
             quit: std::mem::take(&mut self.quit),
         }
@@ -1847,19 +1917,10 @@ impl NotchWindow {
                 && (slides.get(self.state.active) == Some(&kind) || self.state.split_shows(kind))
         };
 
-        let collapsed_stats_visible = collapsed_shows(SlideKind::Stats)
-            && crate::notch::notify::global_store()
-                .read()
-                .active_toast
-                .is_none();
-        let stats_visible = collapsed_stats_visible || expanded_shows(SlideKind::Stats);
-        // Only the Clock slide reads the time. Keying every frame on it
-        // repainted a collapsed notch once a second whatever it was showing.
-        let clock_visible = collapsed_shows(SlideKind::Clock) || expanded_shows(SlideKind::Clock);
-        if stats_visible {
-            crate::stats::request_sampling();
-        }
         let shows = |kind: SlideKind| collapsed_shows(kind) || expanded_shows(kind);
+        // The idle Media face deliberately becomes the compact clock too.
+        let clock_visible = shows(SlideKind::Clock)
+            || (shows(SlideKind::Media) && !self.painter.media.has_session());
         let timer = if shows(SlideKind::Timer) {
             crate::notch::timer::view(&cfg.notch.timer).key()
         } else {
@@ -1888,16 +1949,12 @@ impl NotchWindow {
         } else {
             0
         };
-        let media_clock = if expanded_shows(SlideKind::Media) {
+        let media_clock = if shows(SlideKind::Media) {
             self.painter.media.position_key()
         } else {
             0
         };
-        let stats_revision = if stats_visible {
-            crate::stats::snapshot().revision
-        } else {
-            0
-        };
+        let stats_revision = 0;
         let notification_expanded_visible = expanded_alpha > 0.004
             && slides.iter().enumerate().any(|(index, slide)| {
                 *slide == SlideKind::Notifications
@@ -1940,7 +1997,7 @@ impl NotchWindow {
             clock: if clock_visible { clock_key() } else { 0 },
             media: self.painter.media.revision(),
             notifications: notification_revision,
-            usage: crate::notch::notify::usage_revision(),
+            usage: 0,
             // An effect scoped away from the notch's current state draws nothing,
             // so it must not keep the frames coming either.
             effect: self
@@ -1969,10 +2026,10 @@ impl NotchWindow {
             adding_item: self.state.adding_item(),
             feedback: (
                 self.state.hot_shown.map(|t| t.hit),
-                (self.state.hot_amount.value * 100.0) as i32,
+                (self.state.hot_amount.value * 1000.0) as i32,
                 self.state
                     .press
-                    .map(|p| (p.target.hit, (p.progress() * 100.0) as i32)),
+                    .map(|p| (p.target.hit, (p.progress() * 1000.0) as i32)),
             ),
             menu: self.menu.as_ref().map(MenuView::key),
             pod_content: scene
@@ -2007,30 +2064,25 @@ impl NotchWindow {
             .find(|t| t.contains(x, y))
     }
 
-    /// The music controls on the closed pill, when it is resting on Now
-    /// Playing and something owns the media session. With the split pill on
-    /// they sit at the right end of the middle face, where they are drawn.
-    fn pill_targets(&self, cfg: &AppConfig, shape: NotchShape, scene: &Scene) -> Vec<Target> {
-        let resting = self.state.expand.value < 0.05 && self.state.toast_progress.value < 0.01;
-        let on_media =
-            cfg.notch.effective_slides().get(self.state.active) == Some(&SlideKind::Media);
-        if !resting || !on_media || !self.painter.media.has_session() {
-            return Vec::new();
+    fn media_player_body(&self, cfg: &AppConfig, raw: D2D_RECT_F) -> D2D_RECT_F {
+        let show_lyrics = cfg.notch.media.lyrics && self.painter.media.snapshot().lyrics.is_some();
+        crate::notch::geom::media_regions(raw, show_lyrics).player
+    }
+
+    fn seek_media_at(&mut self, cfg: &AppConfig, shape: NotchShape, x: f32, force: bool) {
+        if !force && self.last_media_seek.elapsed() < Duration::from_millis(90) {
+            return;
         }
-        let [left, right] = scene.segments;
-        let face = NotchShape {
-            left: left.map(|s| s.right).unwrap_or(shape.left),
-            right: right.map(|s| s.left).unwrap_or(shape.right),
-            ..shape
-        };
-        if face.width() < crate::notch::paint::PILL_CONTROLS_MIN_W {
-            return Vec::new();
+        let raw = crate::notch::geom::slide_body(shape);
+        let player = self.media_player_body(cfg, raw);
+        let track = crate::notch::geom::media_timeline_hitbox(player);
+        let width = track.right - track.left;
+        let now = self.painter.media.snapshot();
+        if width > 1.0 && now.duration_secs > 0.0 {
+            let fraction = ((x - track.left) / width).clamp(0.0, 1.0) as f64;
+            self.painter.media.seek_to(now.duration_secs * fraction);
+            self.last_media_seek = Instant::now();
         }
-        crate::notch::geom::pill_media_buttons(face)
-            .into_iter()
-            .enumerate()
-            .map(|(i, (x, y, r))| Target::round(Hit::Pill(i as u8), (x, y, r - 2.0)))
-            .collect()
     }
 
     /// Every clickable target on the open panel, buttons first.
@@ -2045,8 +2097,16 @@ impl NotchWindow {
         let body = layout_rect(raw);
         match slide {
             SlideKind::Media => {
-                for (i, button) in geom::media_transport_buttons(raw).into_iter().enumerate() {
+                let player = self.media_player_body(cfg, raw);
+                for (i, button) in geom::media_transport_buttons(player)
+                    .into_iter()
+                    .enumerate()
+                {
                     out.push(Target::round(Hit::Media(i as u8), button));
+                }
+                let timeline = geom::media_timeline_hitbox(player);
+                if timeline.right > timeline.left {
+                    out.push(Target::rect(Hit::MediaSeek, layout_rect(timeline), 8.0));
                 }
             }
             SlideKind::Timer => {
@@ -2167,22 +2227,6 @@ impl NotchWindow {
                 return false;
             }
 
-            // The music controls on the pill act where they are, without
-            // opening anything.
-            if let Some(target) = self
-                .pill_targets(cfg, shape, scene)
-                .into_iter()
-                .find(|t| t.contains(cx, cy))
-            {
-                self.state.press(target, cx, cy);
-                match target.hit {
-                    Hit::Pill(0) => self.painter.media.previous(),
-                    Hit::Pill(1) => self.painter.media.play_pause(),
-                    _ => self.painter.media.next(),
-                }
-                return false;
-            }
-
             // A chosen click gesture (Ctrl + click, middle click…) is then
             // the only click that opens the notch; a plain click does not.
             if !cfg.notch.input.open_with.clicks()
@@ -2215,9 +2259,13 @@ impl NotchWindow {
         self.state.press(target, cx, cy);
 
         match target.hit {
-            Hit::Pill(0) | Hit::Media(0) => self.painter.media.previous(),
-            Hit::Pill(1) | Hit::Media(1) => self.painter.media.play_pause(),
-            Hit::Pill(_) | Hit::Media(_) => self.painter.media.next(),
+            Hit::Media(0) => self.painter.media.previous(),
+            Hit::Media(1) => self.painter.media.play_pause(),
+            Hit::Media(_) => self.painter.media.next(),
+            Hit::MediaSeek => {
+                self.media_scrubbing = true;
+                self.seek_media_at(cfg, shape, cx, true);
+            }
             Hit::Timer(0) => crate::notch::timer::reset(),
             Hit::Timer(1) => crate::notch::timer::toggle(&cfg.notch.timer),
             Hit::Timer(_) => crate::notch::timer::skip(&cfg.notch.timer),
@@ -2238,10 +2286,15 @@ impl NotchWindow {
             }
             Hit::ClipClear => crate::notch::clipboard::clear(),
             Hit::Clip(index) => {
-                if let Some(text) = crate::notch::clipboard::items().get(index) {
+                let text_items = crate::notch::clipboard::items();
+                if let Some(text) = text_items.get(index) {
                     if crate::notch::clipboard::copy_text(text) {
                         self.state.flash(Badge::Copied);
                     }
+                } else if index == text_items.len()
+                    && crate::notch::clipboard::drag_latest_image(self.hwnd)
+                {
+                    self.state.flash(Badge::Copied);
                 }
             }
             Hit::Focus => {

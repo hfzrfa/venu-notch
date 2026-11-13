@@ -577,10 +577,10 @@ pub fn status_list(column: Rect, count: usize) -> StatusList {
 /// Something in the open panel that does something when clicked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
-    /// Previous, play/pause, next on the closed pill.
-    Pill(u8),
     /// Now Playing: previous, play/pause, next.
     Media(u8),
+    /// Now Playing progress track; click or drag to seek.
+    MediaSeek,
     /// Focus timer: reset, start/pause, skip.
     Timer(u8),
     /// A Quick Toggles tile.
@@ -933,7 +933,7 @@ mod tests {
 
     #[test]
     fn round_buttons_answer_to_their_circle_with_a_little_slop() {
-        let button = Target::round(Hit::Pill(1), (100.0, 50.0, 9.0));
+        let button = Target::round(Hit::Media(1), (100.0, 50.0, 9.0));
         assert!(button.is_round());
         assert!(button.contains(100.0, 50.0));
         assert!(button.contains(113.0, 50.0), "slop past the drawn edge");

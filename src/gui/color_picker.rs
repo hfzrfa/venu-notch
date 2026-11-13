@@ -224,7 +224,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
             rect,
             rounding,
             Stroke::new(
-                1.0,
+                1.0_f32,
                 if is_open {
                     theme::accent()
                 } else if response.hovered() {
@@ -262,7 +262,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
         ui.painter().rect_stroke(
             swatch_rect,
             swatch_rounding,
-            Stroke::new(1.0, Color32::from_white_alpha(35)),
+            Stroke::new(1.0_f32, Color32::from_white_alpha(35)),
         );
 
         // Hex Code Text
@@ -343,7 +343,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                 );
                 ui.painter().rect_filled(h_rect, h_round, c_active);
                 ui.painter()
-                    .rect_stroke(h_rect, h_round, Stroke::new(1.0, theme::divider()));
+                    .rect_stroke(h_rect, h_round, Stroke::new(1.0_f32, theme::divider()));
 
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
@@ -428,7 +428,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                 ui.painter().rect_stroke(
                     sv_rect,
                     Rounding::same(4.0),
-                    Stroke::new(1.0, theme::divider()),
+                    Stroke::new(1.0_f32, theme::divider()),
                 );
 
                 // SV Reticle handle
@@ -440,9 +440,9 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                 ui.painter()
                     .circle_filled(handle_pos, 7.0, Color32::from_black_alpha(80));
                 ui.painter()
-                    .circle_stroke(handle_pos, 6.0, Stroke::new(2.0, Color32::WHITE));
+                    .circle_stroke(handle_pos, 6.0, Stroke::new(2.0_f32, Color32::WHITE));
                 ui.painter()
-                    .circle_stroke(handle_pos, 4.0, Stroke::new(1.0, Color32::BLACK));
+                    .circle_stroke(handle_pos, 4.0, Stroke::new(1.0_f32, Color32::BLACK));
             }
 
             ui.add_space(8.0);
@@ -512,7 +512,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                 ui.painter().rect_stroke(
                     hue_rect,
                     Rounding::same(6.0),
-                    Stroke::new(1.0, theme::divider()),
+                    Stroke::new(1.0_f32, theme::divider()),
                 );
 
                 // Hue Thumb
@@ -523,7 +523,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                 ui.painter().circle_stroke(
                     thumb_pos,
                     7.0,
-                    Stroke::new(1.5, Color32::from_black_alpha(120)),
+                    Stroke::new(1.5_f32, Color32::from_black_alpha(120)),
                 );
             }
 
@@ -590,7 +590,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                 ui.painter().rect_stroke(
                     alpha_rect,
                     Rounding::same(6.0),
-                    Stroke::new(1.0, theme::divider()),
+                    Stroke::new(1.0_f32, theme::divider()),
                 );
 
                 // Alpha Thumb
@@ -601,7 +601,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                 ui.painter().circle_stroke(
                     thumb_pos,
                     7.0,
-                    Stroke::new(1.5, Color32::from_black_alpha(120)),
+                    Stroke::new(1.5_f32, Color32::from_black_alpha(120)),
                 );
             }
 
@@ -831,7 +831,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                             s_rect,
                             s_rounding,
                             Stroke::new(
-                                if s_resp.hovered() { 1.5 } else { 0.5 },
+                                if s_resp.hovered() { 1.5 } else { 0.5_f32 },
                                 if s_resp.hovered() {
                                     theme::text_primary()
                                 } else {

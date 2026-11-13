@@ -1,4 +1,4 @@
-# Generates assets\venu.ico from assets\icon.png, the Venu logo (the same
+# Generates assets\nova.ico from assets\nova-logo.png, the Nova logo (the same
 # transparent cut-out the website uses as its favicon).
 #
 # The ICO carries one PNG-compressed entry per size Windows asks for — taskbar,
@@ -11,7 +11,7 @@
 Add-Type -AssemblyName System.Drawing
 
 $root = Split-Path $PSScriptRoot -Parent
-$source = [System.Drawing.Image]::FromFile((Join-Path $root "assets\icon.png"))
+$source = [System.Drawing.Image]::FromFile((Join-Path $root "assets\nova-logo.png"))
 $sizes = 16, 20, 24, 32, 40, 48, 64, 96, 128, 256
 
 $entries = foreach ($size in $sizes) {
@@ -49,6 +49,6 @@ foreach ($e in $entries) {
 foreach ($e in $entries) { $w.Write($e.Png) }
 $w.Flush()
 
-$dest = Join-Path $root "assets\venu.ico"
+$dest = Join-Path $root "assets\nova.ico"
 [System.IO.File]::WriteAllBytes($dest, $out.ToArray())
 Write-Host ("Wrote {0} ({1} bytes, sizes {2})" -f $dest, $out.Length, ($sizes -join ", "))

@@ -379,12 +379,13 @@ impl MenuView {
 
     /// Everything that changes what it looks like, quantised, for the
     /// notch's frame key.
-    pub fn key(&self) -> [i32; 6] {
+    pub fn key(&self) -> [i32; 7] {
         [
-            (self.open.value * 200.0) as i32,
-            (self.hl_top.value * 4.0) as i32,
-            (self.hl_left.value * 4.0) as i32,
-            (self.hl_alpha.value * 100.0) as i32,
+            (self.open.value * 1000.0) as i32,
+            (self.hl_top.value * 8.0) as i32,
+            (self.hl_left.value * 8.0) as i32,
+            (self.hl_right.value * 8.0) as i32,
+            (self.hl_alpha.value * 1000.0) as i32,
             self.pressed
                 .map_or(-1, |s| s.row as i32 * 2 + s.half as i32),
             self.rect.top as i32 * 4096 + self.rect.left as i32,
@@ -414,7 +415,7 @@ mod tests {
                 },
             ),
             MenuRow::Separator,
-            MenuRow::danger(MenuCommand::Quit, "Quit Venu", glyph::POWER),
+            MenuRow::danger(MenuCommand::Quit, "Quit Nova", glyph::POWER),
         ]
     }
 

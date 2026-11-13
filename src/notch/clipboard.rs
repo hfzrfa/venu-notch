@@ -7,14 +7,15 @@
 //! read, and turning the feature off drops everything collected.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use parking_lot::{Mutex, RwLock};
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::{implement, HSTRING, PCWSTR};
 use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Foundation::{
-    GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    GlobalFree, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, HANDLE, HGLOBAL,
+    HWND, LPARAM, LRESULT, POINT, S_OK, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{BITMAPINFOHEADER, BI_RGB};
 use windows::Win32::Graphics::Imaging::{
@@ -22,7 +23,7 @@ use windows::Win32::Graphics::Imaging::{
     WICBitmapDitherTypeNone, WICBitmapPaletteTypeMedianCut, WICDecodeMetadataCacheOnLoad,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, IDataObject, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::DataExchange::{
@@ -31,8 +32,15 @@ use windows::Win32::System::DataExchange::{
     RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::UI::Shell::DROPFILES;
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
+use windows::Win32::System::Ole::{IDropSource, IDropSource_Impl, DROPEFFECT_COPY};
+use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
+use windows::Win32::UI::Shell::{
+    ILClone, ILFindLastID, ILFree, ILRemoveLastID, SHCreateDataObject, SHDoDragDrop,
+    SHParseDisplayName, DROPFILES,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
     RegisterClassW, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WM_CLIPBOARDUPDATE, WM_CLOSE, WNDCLASSW,
@@ -58,6 +66,9 @@ static HISTORY: RwLock<History> = RwLock::new(History {
 });
 static REVISION: AtomicU64 = AtomicU64::new(0);
 static LIMIT: AtomicU32 = AtomicU32::new(15);
+static IMAGES_ENABLED: AtomicBool = AtomicBool::new(true);
+static LATEST_IMAGE: RwLock<Option<(u32, u32)>> = RwLock::new(None);
+static LATEST_IMAGE_PATH: RwLock<Option<String>> = RwLock::new(None);
 /// The listener window, while it runs.
 static LISTENER: Mutex<Option<isize>> = Mutex::new(None);
 
@@ -73,7 +84,11 @@ pub fn items() -> Vec<String> {
 
 /// How many entries there are, without cloning them.
 pub fn len() -> usize {
-    HISTORY.read().items.len()
+    HISTORY.read().items.len() + usize::from(LATEST_IMAGE.read().is_some())
+}
+
+pub fn latest_image() -> Option<(u32, u32)> {
+    *LATEST_IMAGE.read()
 }
 
 /// The newest entry, if any.
@@ -83,16 +98,21 @@ pub fn latest() -> Option<String> {
 
 pub fn clear() {
     HISTORY.write().items.clear();
+    *LATEST_IMAGE.write() = None;
+    if let Some(path) = LATEST_IMAGE_PATH.write().take() {
+        let _ = std::fs::remove_file(path);
+    }
     REVISION.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Start or stop listening to match the settings. Called every tick; a lock
 /// and a comparison unless something changed.
-pub fn sync(enabled: bool, max_items: u32) {
+pub fn sync(enabled: bool, max_items: u32, images: bool) {
     LIMIT.store(
         max_items.clamp(1, crate::config::ClipboardConfig::MAX),
         Ordering::Relaxed,
     );
+    IMAGES_ENABLED.store(images, Ordering::Relaxed);
     let mut listener = LISTENER.lock();
     match (enabled, *listener) {
         (true, None) => {
@@ -100,7 +120,7 @@ pub fn sync(enabled: bool, max_items: u32) {
             // does not start a second one.
             *listener = Some(0);
             let _ = std::thread::Builder::new()
-                .name("Venu clipboard".to_owned())
+                .name("Nova clipboard".to_owned())
                 .spawn(run);
         }
         (false, Some(hwnd)) => {
@@ -137,7 +157,7 @@ fn run() {
             *LISTENER.lock() = None;
             return;
         };
-        let class = HSTRING::from("VenuClipboardListener");
+        let class = HSTRING::from("NovaClipboardListener");
         let wc = WNDCLASSW {
             hInstance: instance.into(),
             lpszClassName: PCWSTR(class.as_ptr()),
@@ -198,6 +218,17 @@ unsafe extern "system" fn listener_proc(
         WM_CLIPBOARDUPDATE => {
             if let Some(text) = read_text(hwnd) {
                 remember(text);
+            } else if IMAGES_ENABLED.load(Ordering::Relaxed) {
+                if let Some((size, path)) = read_image_file(hwnd) {
+                    let mut image = LATEST_IMAGE.write();
+                    if *image != Some(size) {
+                        *image = Some(size);
+                        *LATEST_IMAGE_PATH.write() = Some(path);
+                        drop(image);
+                        REVISION.fetch_add(1, Ordering::AcqRel);
+                        notify_image(size);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -208,6 +239,140 @@ unsafe extern "system" fn listener_proc(
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn notify_image((width, height): (u32, u32)) {
+    crate::notch::notify::global_store().write().push(
+        "Clipboard",
+        "Screenshot copied",
+        &format!("Image {width} × {height} is available in the notch."),
+        crate::notch::notify::NotificationLevel::Success,
+        4.5,
+        &[],
+    );
+}
+
+/// Read only the DIB header. Keeping screenshot pixels duplicated in history
+/// could cost tens of megabytes; Windows remains the owner of the real image.
+fn read_image_file(hwnd: HWND) -> Option<((u32, u32), String)> {
+    if private() || unsafe { IsClipboardFormatAvailable(CF_DIB) }.is_err() {
+        return None;
+    }
+    unsafe {
+        if OpenClipboard(hwnd).is_err() {
+            return None;
+        }
+        let result = GetClipboardData(CF_DIB).ok().and_then(|handle| {
+            let global = HGLOBAL(handle.0);
+            let ptr = GlobalLock(global) as *const u8;
+            if ptr.is_null() {
+                return None;
+            }
+            let size = GlobalSize(global);
+            if size < std::mem::size_of::<BITMAPINFOHEADER>() {
+                let _ = GlobalUnlock(global);
+                return None;
+            }
+            let header = *(ptr as *const BITMAPINFOHEADER);
+            let dib = std::slice::from_raw_parts(ptr, size).to_vec();
+            let _ = GlobalUnlock(global);
+            let width = header.biWidth.unsigned_abs();
+            let height = header.biHeight.unsigned_abs();
+            if width == 0 || height == 0 || width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE {
+                return None;
+            }
+            persist_dib_as_bmp(&dib, &header).map(|path| ((width, height), path))
+        });
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+/// Keep one recoverable temp file so the screenshot row can be dragged into
+/// Explorer, chat apps, editors, or browser upload targets as a normal image.
+fn persist_dib_as_bmp(dib: &[u8], header: &BITMAPINFOHEADER) -> Option<String> {
+    let dir = std::env::temp_dir().join("Nova");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("clipboard-screenshot.bmp");
+    let header_size = header.biSize as usize;
+    let palette_entries = if header.biClrUsed > 0 {
+        header.biClrUsed as usize
+    } else if header.biBitCount <= 8 {
+        1usize << header.biBitCount
+    } else {
+        0
+    };
+    let masks = usize::from(header.biCompression == 3 && header_size == 40) * 12;
+    let pixel_offset = 14 + header_size + palette_entries * 4 + masks;
+    let file_size = 14usize.checked_add(dib.len())?;
+    let mut bmp = Vec::with_capacity(file_size);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0; 4]);
+    bmp.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
+    bmp.extend_from_slice(dib);
+    std::fs::write(&path, bmp).ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+
+#[implement(IDropSource)]
+struct ScreenshotDropSource;
+
+impl IDropSource_Impl for ScreenshotDropSource_Impl {
+    fn QueryContinueDrag(
+        &self,
+        escape_pressed: windows::Win32::Foundation::BOOL,
+        key_state: MODIFIERKEYS_FLAGS,
+    ) -> windows::core::HRESULT {
+        if escape_pressed.as_bool() {
+            DRAGDROP_S_CANCEL
+        } else if key_state.0 & MK_LBUTTON.0 == 0 {
+            DRAGDROP_S_DROP
+        } else {
+            S_OK
+        }
+    }
+
+    fn GiveFeedback(
+        &self,
+        _effect: windows::Win32::System::Ole::DROPEFFECT,
+    ) -> windows::core::HRESULT {
+        DRAGDROP_S_USEDEFAULTCURSORS
+    }
+}
+
+/// Start a native shell drag for the latest captured screenshot. Called while
+/// the left button is still held over its row.
+pub fn drag_latest_image(hwnd: HWND) -> bool {
+    let Some(path) = LATEST_IMAGE_PATH.read().clone() else {
+        return false;
+    };
+    unsafe {
+        let wide = HSTRING::from(path);
+        let mut full = std::ptr::null_mut();
+        if SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut full, 0, None).is_err()
+            || full.is_null()
+        {
+            return false;
+        }
+        let child = ILFindLastID(full);
+        let parent = ILClone(full);
+        if child.is_null() || parent.is_null() || !ILRemoveLastID(Some(parent)).as_bool() {
+            ILFree(Some(full));
+            ILFree(Some(parent));
+            return false;
+        }
+        let children = [child as *const _];
+        let data: windows::core::Result<IDataObject> =
+            SHCreateDataObject(Some(parent), Some(&children), None::<&IDataObject>);
+        let dragged = data.is_ok_and(|data| {
+            let source: IDropSource = ScreenshotDropSource.into();
+            SHDoDragDrop(hwnd, &data, &source, DROPEFFECT_COPY).is_ok()
+        });
+        ILFree(Some(parent));
+        ILFree(Some(full));
+        dragged
     }
 }
 
@@ -433,7 +598,7 @@ pub fn copy_text(text: &str) -> bool {
 pub fn copy_file(path: &str) {
     let path = path.to_owned();
     let _ = std::thread::Builder::new()
-        .name("Venu copy".to_owned())
+        .name("Nova copy".to_owned())
         .spawn(move || {
             let mut blocks = vec![(CF_HDROP, drop_files(&path))];
             let lower = path.to_ascii_lowercase();

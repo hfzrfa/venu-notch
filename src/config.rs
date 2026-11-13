@@ -203,22 +203,20 @@ pub enum SlideKind {
     /// One-click switches: microphone, sound, dark mode, keep awake.
     Controls,
     /// Pinned files, folders, apps and scripts, plus the newest files of one
-    /// folder. Venu stores paths only, never copies.
+    /// folder. Nova stores paths only, never copies.
     Shelf,
     /// Recently copied text, one click to copy it again. Opt-in, memory only.
     Clipboard,
 }
 
 impl SlideKind {
-    pub const ALL: [SlideKind; 13] = [
+    pub const ALL: [SlideKind; 11] = [
         SlideKind::Status,
         SlideKind::Clock,
         SlideKind::Marquee,
         SlideKind::Wallpaper,
         SlideKind::Media,
         SlideKind::Notifications,
-        SlideKind::Usage,
-        SlideKind::Stats,
         SlideKind::Timer,
         SlideKind::Calendar,
         SlideKind::Controls,
@@ -258,7 +256,6 @@ impl SlideKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CollapsedMode {
     /// Stays on whichever slide was last viewed in the carousel.
-    #[default]
     LastActive,
     /// Resets to Status slide.
     Status,
@@ -281,11 +278,12 @@ pub enum CollapsedMode {
     /// Resets to the calendar slide.
     Calendar,
     /// Smart / Auto mode: shows active alerts if unread, or Now Playing if music is on, otherwise Clock.
+    #[default]
     Auto,
 }
 
 impl CollapsedMode {
-    pub const ALL: [CollapsedMode; 12] = [
+    pub const ALL: [CollapsedMode; 10] = [
         CollapsedMode::LastActive,
         CollapsedMode::Status,
         CollapsedMode::Clock,
@@ -293,8 +291,6 @@ impl CollapsedMode {
         CollapsedMode::Wallpaper,
         CollapsedMode::Media,
         CollapsedMode::Notifications,
-        CollapsedMode::Usage,
-        CollapsedMode::Stats,
         CollapsedMode::Timer,
         CollapsedMode::Calendar,
         CollapsedMode::Auto,
@@ -469,10 +465,10 @@ pub struct BorderEffectConfig {
 impl BorderEffectConfig {
     pub const MIN_INTERVAL_SECS: u32 = 5;
     pub const MAX_INTERVAL_SECS: u32 = 600;
-    /// Frames a second a looping effect is drawn at. Half the overlay's full
-    /// rate: the motion is slow enough that the difference does not show,
-    /// and it halves what a never-ending effect costs.
-    pub const CONTINUOUS_FPS: f32 = 30.0;
+    /// Frames a second a looping effect is drawn at. Sixty keeps the rim
+    /// continuous even on high-refresh displays without repainting it at the
+    /// full interactive cadence when that would not add visible detail.
+    pub const CONTINUOUS_FPS: f32 = 60.0;
 }
 
 impl Default for BorderEffectConfig {
@@ -521,6 +517,11 @@ pub struct CalendarConfig {
     /// An iCal (`.ics`) address — the "secret address" Google Calendar or
     /// Outlook offer for sharing — or a path to an `.ics` file.
     pub source: String,
+    /// Optional Google Calendar API key. This works for calendars made public;
+    /// private calendars should use their secret iCal address instead.
+    pub google_api_key: String,
+    /// Calendar id used with `google_api_key`, usually an email address.
+    pub google_calendar_id: String,
     /// How often the feed is fetched again.
     pub refresh_mins: u32,
 }
@@ -529,6 +530,8 @@ impl Default for CalendarConfig {
     fn default() -> Self {
         Self {
             source: String::new(),
+            google_api_key: String::new(),
+            google_calendar_id: String::new(),
             refresh_mins: 15,
         }
     }
@@ -549,6 +552,38 @@ impl Default for BatteryAlertConfig {
         Self {
             enabled: true,
             low_pct: 20,
+        }
+    }
+}
+
+/// Local prayer-time reminders. Times are calculated locally using Kemenag
+/// angles; location is the only input and no online account is required.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrayerConfig {
+    pub enabled: bool,
+    /// Draw today's prayer timeline on the Clock slide and show the next
+    /// prayer on standby during its final ten minutes.
+    pub show_on_clock: bool,
+    /// Use the last position obtained from Windows Location Services.
+    pub automatic_location: bool,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub location_name: String,
+    /// Small correction for local mosque schedules.
+    pub adjustment_minutes: i32,
+}
+
+impl Default for PrayerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            show_on_clock: true,
+            automatic_location: true,
+            latitude: -6.2,
+            longitude: 106.816_666,
+            location_name: "Jakarta".to_owned(),
+            adjustment_minutes: 0,
         }
     }
 }
@@ -801,7 +836,7 @@ impl MarqueeConfig {
 /// touching any slider afterwards turns it into [`ShapePreset::Custom`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ShapePreset {
-    /// The original Venu silhouette.
+    /// The original Nova silhouette.
     #[default]
     Classic,
     /// Fully round ends with small shoulders — the phone-island look.
@@ -970,7 +1005,7 @@ impl Default for SplitConfig {
         Self {
             enabled: false,
             left: Some(SlideKind::Clock),
-            right: Some(SlideKind::Stats),
+            right: Some(SlideKind::Media),
             open_hovered: true,
         }
     }
@@ -1264,6 +1299,12 @@ pub struct MediaConfig {
     /// Let the equaliser bars follow the sound that is actually playing.
     /// Off, they stand still. On costs a light repaint while music plays.
     pub live_wave: bool,
+    /// Look up synced/plain lyrics for the active track. One request is made
+    /// per track and results stay in memory only.
+    pub lyrics: bool,
+    /// Retained only to deserialize older configuration files. Artwork colour
+    /// overlays are no longer painted.
+    pub artwork_colors: bool,
     /// Panel size for this slide; 0 means the centred default.
     pub panel_width: u32,
     pub panel_height: u32,
@@ -1273,16 +1314,12 @@ impl Default for MediaConfig {
     fn default() -> Self {
         Self {
             live_wave: true,
+            lyrics: true,
+            artwork_colors: false,
             panel_width: 0,
             panel_height: 0,
         }
     }
-}
-
-impl MediaConfig {
-    /// The centred player's own size, used while the size fields are 0.
-    pub const AUTO_WIDTH: f32 = 470.0;
-    pub const AUTO_HEIGHT: f32 = 300.0;
 }
 
 /// Files, folders, apps and scripts pinned to the notch. Only the paths are
@@ -1332,6 +1369,8 @@ impl ShelfConfig {
 #[serde(default)]
 pub struct ClipboardConfig {
     pub enabled: bool,
+    /// Keep a bounded thumbnail when an image/screenshot enters the clipboard.
+    pub images: bool,
     pub max_items: u32,
 }
 
@@ -1339,6 +1378,7 @@ impl Default for ClipboardConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            images: true,
             max_items: 15,
         }
     }
@@ -1360,6 +1400,14 @@ pub struct NotchConfig {
     pub offset_y: i32,
     pub collapsed_width: u32,
     pub collapsed_height: u32,
+    /// Retreat to a small top-edge handle while idle. Hover restores the
+    /// ordinary collapsed pill before the configured open gesture takes over.
+    #[serde(default)]
+    pub minimize_when_idle: bool,
+    /// When no media session exists, replace the ordinary idle clock face
+    /// with the compact twin-light ambient island.
+    #[serde(default = "default_true")]
+    pub ambient_standby: bool,
     pub expanded_width: u32,
     pub expanded_height: u32,
     pub slides: Vec<SlideKind>,
@@ -1378,6 +1426,8 @@ pub struct NotchConfig {
     pub calendar: CalendarConfig,
     #[serde(default)]
     pub battery: BatteryAlertConfig,
+    #[serde(default)]
+    pub prayer: PrayerConfig,
     pub accent: [f32; 4],
     pub surface: [f32; 4],
     #[serde(default = "default_theme")]
@@ -1443,16 +1493,19 @@ impl Default for NotchConfig {
             offset_y: 0,
             collapsed_width: 188,
             collapsed_height: 34,
+            minimize_when_idle: false,
+            ambient_standby: true,
             expanded_width: 760,
             expanded_height: 208,
             slides: SlideKind::default_deck(),
             active_slide: 0,
-            default_collapsed: CollapsedMode::LastActive,
+            default_collapsed: CollapsedMode::Auto,
             notifications: NotificationConfig::default(),
             border_effect: BorderEffectConfig::default(),
             timer: TimerConfig::default(),
             calendar: CalendarConfig::default(),
             battery: BatteryAlertConfig::default(),
+            prayer: PrayerConfig::default(),
             accent: [1.0, 0.604, 0.235, 1.0],     // ember
             surface: [0.031, 0.031, 0.043, 0.97], // obsidian
             theme: NotchTheme::Dark,
@@ -1477,20 +1530,49 @@ impl Default for NotchConfig {
 
 impl NotchConfig {
     /// Bump with each page that should appear once for existing users.
-    pub const DECK_REVISION: u32 = 1;
+    pub const DECK_REVISION: u32 = 2;
 
     /// Add pages introduced since this config was last saved. Returns whether
     /// anything changed.
     pub fn upgrade_deck(&mut self) -> bool {
-        if self.deck_revision >= Self::DECK_REVISION {
-            return false;
-        }
+        let before = self.clone();
         // Revision 1: the Shelf.
         if self.deck_revision < 1 && !self.slides.contains(&SlideKind::Shelf) {
             self.slides.push(SlideKind::Shelf);
         }
+        // Revision 2 removes the AI Usage and Stats products. Keep their enum
+        // spellings only so old JSON can still be loaded and migrated.
+        if self.deck_revision < 2 {
+            self.slides
+                .retain(|kind| !matches!(kind, SlideKind::Usage | SlideKind::Stats));
+            self.slide_order
+                .retain(|kind| !matches!(kind, SlideKind::Usage | SlideKind::Stats));
+            if matches!(self.split.left, Some(SlideKind::Usage | SlideKind::Stats)) {
+                self.split.left = Some(SlideKind::Clock);
+            }
+            if matches!(self.split.right, Some(SlideKind::Usage | SlideKind::Stats)) {
+                self.split.right = Some(SlideKind::Media);
+            }
+            if matches!(
+                self.default_collapsed,
+                CollapsedMode::LastActive | CollapsedMode::Usage | CollapsedMode::Stats
+            ) {
+                self.default_collapsed = CollapsedMode::Auto;
+            }
+            self.active_slide = self.active_slide.min(self.slides.len().saturating_sub(1));
+        }
+        // Sanitize even a hand-edited config that already claims the newest
+        // revision: removed products must not be able to restart their old
+        // telemetry path.
+        self.slides
+            .retain(|kind| !matches!(kind, SlideKind::Usage | SlideKind::Stats));
+        self.slide_order
+            .retain(|kind| !matches!(kind, SlideKind::Usage | SlideKind::Stats));
+        if self.slides.is_empty() {
+            self.slides.push(SlideKind::Clock);
+        }
         self.deck_revision = Self::DECK_REVISION;
-        true
+        *self != before
     }
 
     /// Every feature, in the user's order, on or off.
@@ -1585,44 +1667,22 @@ impl NotchConfig {
         self.active_slide.min(len.saturating_sub(1))
     }
 
-    /// Add or remove only the Stats face, preserving the current face and the
-    /// user's order for every other slide.
-    pub fn set_stats_enabled(&mut self, enabled: bool) {
-        let previous_kind = self.effective_slides().get(self.clamped_active()).copied();
-        let previous_index = self.clamped_active();
-
-        if enabled {
-            if !self.slides.contains(&SlideKind::Stats) {
-                self.slides.push(SlideKind::Stats);
-            }
-        } else {
-            self.slides.retain(|slide| *slide != SlideKind::Stats);
-            if self.default_collapsed == CollapsedMode::Stats {
-                self.default_collapsed = CollapsedMode::LastActive;
-            }
+    // Compatibility for an unreachable legacy renderer. These are
+    // intentionally one-way: the removed slide cannot be enabled again.
+    #[allow(dead_code)]
+    pub fn set_stats_enabled(&mut self, _enabled: bool) {
+        self.slides.retain(|slide| *slide != SlideKind::Stats);
+        self.slide_order.retain(|slide| *slide != SlideKind::Stats);
+        if self.default_collapsed == CollapsedMode::Stats {
+            self.default_collapsed = CollapsedMode::Auto;
         }
-
-        self.active_slide = previous_kind
-            .filter(|kind| self.slides.contains(kind))
-            .and_then(|kind| self.slides.iter().position(|slide| *slide == kind))
-            .unwrap_or_else(|| {
-                if self.slides.is_empty() {
-                    0
-                } else {
-                    previous_index.min(self.slides.len() - 1)
-                }
-            });
+        self.active_slide = self.clamped_active();
     }
 
-    /// Make Stats the resting face without disturbing the carousel position.
-    pub fn set_stats_default(&mut self, enabled: bool) {
-        if enabled {
-            if !self.slides.contains(&SlideKind::Stats) {
-                self.slides.push(SlideKind::Stats);
-            }
-            self.default_collapsed = CollapsedMode::Stats;
-        } else if self.default_collapsed == CollapsedMode::Stats {
-            self.default_collapsed = CollapsedMode::LastActive;
+    #[allow(dead_code)]
+    pub fn set_stats_default(&mut self, _enabled: bool) {
+        if self.default_collapsed == CollapsedMode::Stats {
+            self.default_collapsed = CollapsedMode::Auto;
         }
     }
 }
@@ -1926,7 +1986,7 @@ pub struct AppConfig {
     /// The settings window's glass, and whether it floats above others.
     #[serde(default)]
     pub settings_window: SettingsWindowConfig,
-    /// Whether Venu registers itself to start when Windows signs in. The
+    /// Whether Nova registers itself to start when Windows signs in. The
     /// registry side of this lives in `crate::autostart`; the entry is
     /// refreshed against this flag on every launch.
     #[serde(default)]
@@ -1940,7 +2000,7 @@ fn default_phrase_spacing() -> u32 {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            text: "⭐ REMINDER: Stay focused & stay hydrated! • Venu Dynamic Notch ⭐".to_string(),
+            text: "⭐ REMINDER: Stay focused & stay hydrated! • Nova Dynamic Notch ⭐".to_string(),
             overlay_enabled: true,
             phrase_spacing: 6,
             edges: EdgeSelection::default(),
@@ -1985,7 +2045,7 @@ impl AppConfig {
 
     pub fn config_path() -> PathBuf {
         if let Some(mut path) = app_config_directory() {
-            path.push("venu");
+            path.push("nova");
             let _ = fs::create_dir_all(&path);
             path.push("config.json");
             path
@@ -2009,9 +2069,12 @@ impl AppConfig {
             }
         }
 
-        // Backward compatibility fallback: check legacy movingtext path if venu doesn't exist yet
-        if let Some(mut legacy_path) = app_config_directory() {
-            legacy_path.push("movingtext");
+        // Import once from either previous product name, then save under Nova.
+        for legacy_name in ["venu", "movingtext"] {
+            let Some(mut legacy_path) = app_config_directory() else {
+                continue;
+            };
+            legacy_path.push(legacy_name);
             legacy_path.push("config.json");
             if legacy_path.exists() {
                 if let Ok(content) = fs::read_to_string(&legacy_path) {
@@ -2081,7 +2144,7 @@ mod tests {
 
     #[test]
     fn notch_config_written_before_shape_split_and_pods_still_loads() {
-        // Strip the new keys out of a current config, as an older Venu
+        // Strip the new keys out of a current config, as an older Nova
         // would have written it, and read it back.
         let mut value = serde_json::to_value(AppConfig::default()).unwrap();
         let notch = value["notch"].as_object_mut().unwrap();
@@ -2200,32 +2263,18 @@ mod tests {
     }
 
     #[test]
-    fn stats_controls_preserve_other_slides_and_the_current_face() {
+    fn removed_usage_and_stats_are_migrated_out() {
         let mut notch = NotchConfig::default();
         notch.slides = vec![SlideKind::Clock, SlideKind::Media, SlideKind::Usage];
-        notch.active_slide = 1;
-        notch.set_stats_enabled(true);
-        assert_eq!(
-            notch.slides,
-            [
-                SlideKind::Clock,
-                SlideKind::Media,
-                SlideKind::Usage,
-                SlideKind::Stats
-            ]
-        );
-        assert_eq!(notch.clamped_active(), 1);
-
-        notch.set_stats_default(true);
-        assert_eq!(notch.default_collapsed, CollapsedMode::Stats);
-        assert_eq!(notch.clamped_active(), 1);
-        notch.set_stats_enabled(false);
-        assert_eq!(
-            notch.slides,
-            [SlideKind::Clock, SlideKind::Media, SlideKind::Usage]
-        );
-        assert_eq!(notch.default_collapsed, CollapsedMode::LastActive);
-        assert_eq!(notch.clamped_active(), 1);
+        notch.slides.push(SlideKind::Stats);
+        notch.slide_order = notch.slides.clone();
+        notch.default_collapsed = CollapsedMode::Stats;
+        notch.deck_revision = 1;
+        assert!(notch.upgrade_deck());
+        assert_eq!(notch.slides, [SlideKind::Clock, SlideKind::Media]);
+        assert!(!notch.slide_order.contains(&SlideKind::Usage));
+        assert!(!notch.slide_order.contains(&SlideKind::Stats));
+        assert_eq!(notch.default_collapsed, CollapsedMode::Auto);
     }
 
     #[test]

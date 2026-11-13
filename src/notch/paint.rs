@@ -7,19 +7,24 @@
 //! looking like a texture being stretched.
 
 use std::cell::{Cell, RefCell};
+use std::io::Cursor;
+use std::time::Instant;
+
+use image::AnimationDecoder;
 
 use windows::core::{Interface, PCWSTR};
 use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED,
-    D2D1_FIGURE_END_OPEN, D2D1_FILL_MODE_WINDING, D2D_POINT_2F, D2D_RECT_F,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_FILL_MODE_WINDING,
+    D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
 };
 use windows::Win32::Graphics::Direct2D::{
     ID2D1Bitmap, ID2D1BitmapBrush, ID2D1DCRenderTarget, ID2D1Factory, ID2D1Geometry, ID2D1Layer,
     ID2D1PathGeometry, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_ALIASED,
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES,
-    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_COMBINE_MODE_EXCLUDE,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_COMBINE_MODE_EXCLUDE,
     D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
     D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS, D2D1_ROUNDED_RECT,
 };
@@ -27,6 +32,7 @@ use windows::Win32::Graphics::DirectWrite::{
     IDWriteTextLayout, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_EXTRA_BOLD,
     DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_WORD_WRAPPING_WRAP,
 };
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, IWICStream,
     WICBitmapDitherTypeNone, WICBitmapPaletteTypeMedianCut, WICDecodeMetadataCacheOnLoad,
@@ -87,6 +93,22 @@ struct CachedArt {
     key: u64,
     generation: u64,
     bitmap: ID2D1Bitmap,
+}
+
+struct StandbyGifFrame {
+    bitmap: ID2D1Bitmap,
+    /// End time of this frame within one loop, in milliseconds.
+    until_ms: u64,
+}
+
+/// `standby.gif` decoded once per Direct2D target. Keeping every frame on the
+/// GPU makes the tiny idle animation a cheap bitmap draw instead of decoding
+/// and allocating sixty times a second.
+struct CachedStandbyGif {
+    generation: u64,
+    frames: Vec<StandbyGifFrame>,
+    total_ms: u64,
+    started: Instant,
 }
 
 /// How much of the last painted frame was moving on its own.
@@ -164,10 +186,15 @@ pub struct Painter {
     pub media: MediaWatcher,
     media_art: Option<CachedArt>,
     media_art_failed: Option<u64>,
+    standby_gif: Option<CachedStandbyGif>,
+    standby_gif_failed_generation: Option<u64>,
     /// Width of the moving text in the pill font, keyed on what it was
     /// measured for, so a text layout is only built when the text, font or
     /// size actually changes.
     text_measure: Option<(String, String, u32, f32)>,
+    /// Same cache for the responsive resting media pill. The current lyric is
+    /// measured by DirectWrite only when the line (or font) changes.
+    media_text_measure: Option<(String, String, u32, f32)>,
     /// Raised by the drawing code while a frame is being painted. A `Cell`
     /// because the slides that report it are split between `&self` and
     /// `&mut self` methods and threading a flag back out of every one of them
@@ -203,12 +230,9 @@ struct IconCache {
     >,
 }
 
-/// The pill is wide enough for music controls from here; side segments are
-/// narrower and leave them out.
-pub const PILL_CONTROLS_MIN_W: f32 = 250.0;
-
 /// Local time, read once per frame.
 struct Clock {
+    year: i32,
     hour24: u32,
     minute: u32,
     second: u32,
@@ -221,6 +245,7 @@ impl Clock {
     fn now() -> Self {
         let st = unsafe { GetLocalTime() };
         Self {
+            year: st.wYear as i32,
             hour24: st.wHour as u32,
             minute: st.wMinute as u32,
             second: st.wSecond as u32,
@@ -297,7 +322,10 @@ impl Painter {
             media: MediaWatcher::spawn(),
             media_art: None,
             media_art_failed: None,
+            standby_gif: None,
+            standby_gif_failed_generation: None,
             text_measure: None,
+            media_text_measure: None,
             motion: Cell::new(Motion::Still),
             solid: RefCell::new(None),
             solid_generation: 0,
@@ -328,6 +356,56 @@ impl Painter {
             .unwrap_or(0.0);
         self.text_measure = Some((text.to_string(), family.clone(), size.to_bits(), width));
         width
+    }
+
+    /// Exact content width for the resting media pill. DirectWrite measures
+    /// the same font and string the painter uses, eliminating the guessed
+    /// character width that left empty space or trimmed long title/artist
+    /// fallbacks too early.
+    pub fn media_standby_width(&mut self, cfg: &AppConfig) -> Option<f32> {
+        let now = self.media.snapshot();
+        // Keep sizing to the visible title/lyric while paused or buffering as
+        // well. Spotify can briefly report either state at track boundaries;
+        // falling back to the configured width there caused the last word to
+        // collapse even though the same lyric remained on screen.
+        if !now.has_session {
+            return None;
+        }
+        let text = now.standby_text(cfg.notch.media.lyrics);
+        let family = &cfg.notch.font_family;
+        let size = theme::SIZE_PILL;
+        let width = if let Some((cached_text, cached_family, cached_size, cached_width)) =
+            &self.media_text_measure
+        {
+            if cached_text == text.as_ref()
+                && cached_family == family
+                && *cached_size == size.to_bits()
+            {
+                *cached_width
+            } else {
+                self.measure_media_text(text.as_ref(), family, size)
+            }
+        } else {
+            self.measure_media_text(text.as_ref(), family, size)
+        };
+        self.media_text_measure = Some((text.into_owned(), family.clone(), size.to_bits(), width));
+
+        Some(crate::notch::media::standby_pill_width(width))
+    }
+
+    fn measure_media_text(&self, text: &str, family: &str, size: f32) -> f32 {
+        self.text
+            .format(family, size, DWRITE_FONT_WEIGHT_SEMI_BOLD)
+            .ok()
+            .and_then(|fmt| {
+                TextEngine::set_wrapping(
+                    &fmt,
+                    windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP,
+                );
+                self.text.layout(text, &fmt, 100_000.0, size * 2.0).ok()
+            })
+            .map(|layout| TextEngine::measure(&layout).0)
+            .unwrap_or(0.0)
     }
 
     /// What the frame just painted needs from the next one. Reading it clears
@@ -642,6 +720,14 @@ impl Painter {
             if art.generation != generation {
                 self.media_art = None;
             }
+        }
+        if self
+            .standby_gif
+            .as_ref()
+            .is_some_and(|gif| gif.generation != generation)
+        {
+            self.standby_gif = None;
+            self.standby_gif_failed_generation = None;
         }
 
         unsafe { t.BeginDraw() };
@@ -1280,8 +1366,11 @@ impl Painter {
                 .notifications
                 .get_app_color(&toast.notification.app);
 
-            // App badge pill on left
-            let pill_w = 78.0;
+            // App badge pill on left. Battery events get a small animated
+            // charge cell, making plug/unplug/full transitions visible even
+            // when the configured notification border is subtle.
+            let battery_toast = app_name.eq_ignore_ascii_case("Battery");
+            let pill_w = if battery_toast { 54.0 } else { 78.0 };
             let pill_h = 20.0;
             let pill_rect = D2D_RECT_F {
                 left: shape.left + 12.0,
@@ -1292,18 +1381,61 @@ impl Painter {
             self.fill_rrect(t, pill_rect, 4.0, theme::fade(app_color, alpha * 0.22));
             self.stroke_rrect(t, pill_rect, 4.0, 1.0, theme::fade(app_color, alpha * 0.6));
 
-            self.label(
-                t,
-                family,
-                &app_name.to_uppercase(),
-                theme::SIZE_LABEL - 2.0,
-                DWRITE_FONT_WEIGHT_BOLD,
-                0.5,
-                pill_w - 4.0,
-                pill_rect.left + 6.0,
-                pill_rect.top + 2.0,
-                theme::fade(app_color, alpha),
-            );
+            if battery_toast {
+                self.report(Motion::Continuous);
+                let cell = D2D_RECT_F {
+                    left: pill_rect.left + 12.0,
+                    top: cy - 6.0,
+                    right: pill_rect.right - 12.0,
+                    bottom: cy + 6.0,
+                };
+                self.stroke_rrect(t, cell, 3.0, 1.4, theme::fade(app_color, alpha));
+                self.fill_rrect(
+                    t,
+                    D2D_RECT_F {
+                        left: cell.right + 1.0,
+                        top: cy - 2.5,
+                        right: cell.right + 3.5,
+                        bottom: cy + 2.5,
+                    },
+                    1.0,
+                    theme::fade(app_color, alpha),
+                );
+                let full = title.eq_ignore_ascii_case("Fully charged");
+                let unplugged = title.eq_ignore_ascii_case("On battery");
+                let phase = (state.elapsed * 1.3).fract();
+                let level = if full {
+                    1.0
+                } else if unplugged {
+                    1.0 - phase
+                } else {
+                    phase
+                };
+                self.fill_rrect(
+                    t,
+                    D2D_RECT_F {
+                        left: cell.left + 2.0,
+                        top: cell.top + 2.0,
+                        right: cell.left + 2.0 + (cell.right - cell.left - 4.0) * level,
+                        bottom: cell.bottom - 2.0,
+                    },
+                    1.5,
+                    theme::fade(app_color, alpha * 0.95),
+                );
+            } else {
+                self.label(
+                    t,
+                    family,
+                    &app_name.to_uppercase(),
+                    theme::SIZE_LABEL - 2.0,
+                    DWRITE_FONT_WEIGHT_BOLD,
+                    0.5,
+                    pill_w - 4.0,
+                    pill_rect.left + 6.0,
+                    pill_rect.top + 2.0,
+                    theme::fade(app_color, alpha),
+                );
+            }
 
             // Title + Body text preview
             let text_x = pill_rect.right + 10.0;
@@ -1338,6 +1470,14 @@ impl Painter {
         // its own read of the same store.
         drop(store_read);
 
+        if cfg.notch.ambient_standby
+            && !self.media.has_session()
+            && matches!(slide, SlideKind::Clock | SlideKind::Media)
+        {
+            self.paint_ambient_standby(t, cfg, state, shape, alpha);
+            return;
+        }
+
         self.paint_face(t, cfg, state, slide, shape, alpha, generation);
     }
 
@@ -1363,8 +1503,14 @@ impl Painter {
 
         match slide {
             SlideKind::Clock => {
+                if !self.media.has_session() {
+                    self.paint_idle_clock_face(t, cfg, shape, alpha);
+                    return;
+                }
                 let clock = Clock::now();
                 let time = clock.time_string(cfg.notch.clock_24h);
+                let upcoming = crate::notch::prayer::upcoming_within(&cfg.notch.prayer, 10);
+                let prayer_clock = upcoming.is_some() && shape.width() >= 250.0;
 
                 let Ok(fmt) = self.text.format(
                     crate::fonts::GEIST_MONO,
@@ -1400,7 +1546,12 @@ impl Painter {
                 }
 
                 let total = tw + suffix_w;
-                let x = cx - total * 0.5;
+                let time_area_right = if prayer_clock {
+                    shape.right - 116.0
+                } else {
+                    shape.right - pad
+                };
+                let x = shape.left + pad + (time_area_right - shape.left - pad - total) * 0.5;
                 self.draw_layout(
                     t,
                     &layout,
@@ -1417,6 +1568,27 @@ impl Painter {
                         // Sits on the baseline of the time, not its centre.
                         cy - th * 0.5 + (th - sh) * 0.72,
                         theme::fade(self.pal.text_lo, alpha),
+                    );
+                }
+                if prayer_clock {
+                    let (next, remaining) = upcoming.expect("prayer window checked above");
+                    self.label(
+                        t,
+                        family,
+                        &format!(
+                            "{}  {:02}:{:02} · {}m",
+                            next.name,
+                            next.minute / 60,
+                            next.minute % 60,
+                            remaining,
+                        ),
+                        theme::SIZE_LABEL,
+                        DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                        0.0,
+                        108.0,
+                        shape.right - 112.0,
+                        cy - theme::SIZE_LABEL * 0.62,
+                        theme::fade(cfg.notch.accent, alpha),
                     );
                 }
             }
@@ -1441,6 +1613,10 @@ impl Painter {
                 else {
                     return;
                 };
+                TextEngine::set_wrapping(
+                    &fmt,
+                    windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP,
+                );
                 self.text.set_ellipsis(&fmt);
                 let Ok(layout) = self.text.layout(&focus, &fmt, avail, shape.height()) else {
                     return;
@@ -1553,11 +1729,15 @@ impl Painter {
 
             SlideKind::Media => {
                 let now = self.media.snapshot();
+                if !now.has_session {
+                    self.paint_idle_clock_face(t, cfg, shape, alpha);
+                    return;
+                }
                 // A small live wave where the dot used to be.
-                let wave_w = 15.0;
+                let wave_w = crate::notch::media::STANDBY_WAVE_WIDTH;
                 self.wave(
                     t,
-                    shape.left + pad + wave_w * 0.5,
+                    shape.left + crate::notch::media::STANDBY_LEFT_PAD + wave_w * 0.5,
                     cy,
                     shape.height() * 0.42,
                     3.0,
@@ -1568,32 +1748,15 @@ impl Painter {
                     ),
                 );
 
-                let text_x = shape.left + pad + wave_w + 9.0;
-                // On the main pill, previous / play-pause / next sit at the
-                // right end; a side segment is too narrow for them.
-                let controls = now.has_session && shape.width() >= PILL_CONTROLS_MIN_W;
-                let right_edge = if controls {
-                    let buttons = crate::notch::geom::pill_media_buttons(shape);
-                    let glyphs = [
-                        "\u{E892}",
-                        if now.playing { "\u{E769}" } else { "\u{E768}" },
-                        "\u{E893}",
-                    ];
-                    for ((x, y, _), glyph) in buttons.into_iter().zip(glyphs) {
-                        self.glyph(t, glyph, 10.5, x, y, theme::fade(self.pal.text_hi, alpha));
-                    }
-                    buttons[0].0 - 14.0
-                } else {
-                    shape.right - pad
-                };
+                let text_x = shape.left
+                    + crate::notch::media::STANDBY_LEFT_PAD
+                    + wave_w
+                    + crate::notch::media::STANDBY_WAVE_GAP;
+                // The resting pill is glanceable only: transport controls
+                // stay in the opened player so the lyric gets the full width.
+                let right_edge = shape.right - crate::notch::media::STANDBY_RIGHT_PAD;
                 let avail = (right_edge - text_x).max(10.0);
-                let text = if !now.has_session {
-                    "Nothing playing".to_string()
-                } else if now.artist.trim().is_empty() {
-                    now.title.trim().to_string()
-                } else {
-                    format!("{} \u{2014} {}", now.title.trim(), now.artist.trim())
-                };
+                let text = now.standby_text(cfg.notch.media.lyrics);
 
                 let Ok(fmt) =
                     self.text
@@ -1601,8 +1764,13 @@ impl Painter {
                 else {
                     return;
                 };
+                TextEngine::set_wrapping(
+                    &fmt,
+                    windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP,
+                );
                 self.text.set_ellipsis(&fmt);
-                let Ok(layout) = self.text.layout(&text, &fmt, avail, shape.height()) else {
+                let Ok(layout) = self.text.layout(text.as_ref(), &fmt, avail, shape.height())
+                else {
                     return;
                 };
                 let (_, th) = TextEngine::measure(&layout);
@@ -2144,7 +2312,13 @@ impl Painter {
                     right: shape.left + 9.0 + side,
                     bottom: cy + side * 0.5,
                 };
-                if !self.fill_media_art(t, &now, art, 5.0, alpha, generation) {
+                let rotation = if now.playing && now.art.is_some() {
+                    self.report(Motion::Ambient);
+                    (state.elapsed * 18.0).rem_euclid(360.0)
+                } else {
+                    0.0
+                };
+                if !self.fill_media_art(t, &now, art, side * 0.5, alpha, generation, rotation) {
                     // No cover (or it would not decode): a quiet tile with a
                     // note on it, so the pod still reads as music.
                     self.fill_rrect(t, art, 5.0, theme::fade(self.pal.well, alpha * 2.2));
@@ -3693,6 +3867,301 @@ impl Painter {
         }
     }
 
+    /// Quiet fallback for an idle Media face: battery at the left, time truly
+    /// centred in the whole notch, and deliberate empty space on the right.
+    fn paint_idle_clock_face(
+        &mut self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        shape: NotchShape,
+        alpha: f32,
+    ) {
+        let clock = Clock::now();
+        let time = clock.time_string(cfg.notch.clock_24h);
+        let cx = (shape.left + shape.right) * 0.5;
+        let cy = (shape.top + shape.bottom) * 0.5;
+        let mut time_width = 0.0;
+        if let Some((layout, width, height)) = self.measure_text(
+            crate::fonts::GEIST_MONO,
+            &time,
+            theme::SIZE_PILL + 3.0,
+            DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+        ) {
+            time_width = width;
+            self.draw_layout(
+                t,
+                &layout,
+                cx - width * 0.5,
+                cy - height * 0.5,
+                theme::fade(self.pal.text_hi, alpha),
+            );
+        }
+
+        if let Some(battery) = crate::notch::battery::current() {
+            // Keep the status icon visually attached to the time even when a
+            // user configures a very wide collapsed pill.
+            let bx = (cx - time_width * 0.5 - 14.0).max(shape.left + theme::PILL_GUTTER + 9.0);
+            let tone = if battery.on_ac {
+                [0.18, 0.88, 0.48, 1.0]
+            } else if battery.pct <= cfg.notch.battery.low_pct {
+                [0.96, 0.35, 0.28, 1.0]
+            } else {
+                [0.18, 0.88, 0.48, 1.0]
+            };
+            self.ring(t, bx, cy, 8.0, 2.4, theme::fade(tone, alpha));
+            let level = (battery.pct as f32 / 100.0).clamp(0.08, 1.0);
+            self.fill_rrect(
+                t,
+                D2D_RECT_F {
+                    left: bx - 3.0,
+                    top: cy + 4.0 - 8.0 * level,
+                    right: bx + 3.0,
+                    bottom: cy + 4.0,
+                },
+                2.0,
+                theme::fade(tone, alpha * 0.95),
+            );
+        }
+
+        if shape.width() >= 250.0 {
+            if let Some((prayer, remaining)) =
+                crate::notch::prayer::upcoming_within(&cfg.notch.prayer, 10)
+            {
+                self.label(
+                    t,
+                    &cfg.notch.font_family,
+                    &format!(
+                        "{} {:02}:{:02} · {}m",
+                        prayer.name,
+                        prayer.minute / 60,
+                        prayer.minute % 60,
+                        remaining
+                    ),
+                    theme::SIZE_LABEL,
+                    DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                    0.0,
+                    (shape.right - (cx + time_width * 0.5 + 12.0) - 8.0).max(48.0),
+                    cx + time_width * 0.5 + 12.0,
+                    cy - theme::SIZE_LABEL * 0.62,
+                    theme::fade(cfg.notch.accent, alpha),
+                );
+            }
+        }
+
+        // The right side was intentionally empty in the original standby
+        // layout. It now balances the battery indicator with the user's
+        // animated mascot, while the clock remains centred in the whole pill.
+        if shape.width() >= 140.0 {
+            self.paint_standby_gif(t, shape, alpha);
+        }
+    }
+
+    /// Minimal idle island from the ambient-standby reference: two soft
+    /// white indicators and a cool edge glow. Everything scales from the
+    /// user's collapsed width/height, so it remains balanced after resizing.
+    fn paint_ambient_standby(
+        &mut self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        state: &NotchState,
+        shape: NotchShape,
+        alpha: f32,
+    ) {
+        let w = shape.width();
+        let h = shape.height();
+        if h < 12.0 || w < 42.0 {
+            return;
+        }
+        self.report(Motion::Ambient);
+        let cx = (shape.left + shape.right) * 0.5;
+        let cy = shape.top + h * 0.48;
+        let spacing = (w * 0.085).clamp(12.0, 28.0);
+        let pulse = 0.92 + (state.elapsed * 1.7).sin() * 0.08;
+        let core = (h * 0.12).clamp(2.8, 5.8);
+        let gaze = (state.elapsed * 0.72).sin() * core * 0.55;
+        for x in [cx - spacing, cx + spacing] {
+            self.dot(t, x, cy, core * 2.8, [0.35, 0.72, 1.0, alpha * 0.035]);
+            self.dot(t, x, cy, core * 1.9, [0.58, 0.84, 1.0, alpha * 0.08]);
+            let eye_w = core * 2.35 * pulse;
+            let eye_h = core * 1.55 * pulse;
+            self.fill_rrect(
+                t,
+                D2D_RECT_F {
+                    left: x - eye_w,
+                    top: cy - eye_h,
+                    right: x + eye_w,
+                    bottom: cy + eye_h,
+                },
+                eye_h,
+                [0.94, 0.98, 1.0, alpha],
+            );
+            // A small pupil makes the twin lights read as eyes and lets both
+            // glance left/right together instead of only pulsing in place.
+            self.dot(
+                t,
+                x + gaze,
+                cy,
+                (core * 0.62).max(1.8),
+                theme::fade(cfg.notch.accent, alpha * 0.92),
+            );
+        }
+
+        let glow_w = (w * 0.62).clamp(34.0, 150.0);
+        let left = cx - glow_w * 0.5;
+        let y = shape.bottom - 1.2;
+        for i in 0..28 {
+            let f0 = i as f32 / 28.0;
+            let f1 = (i + 1) as f32 / 28.0;
+            let mid = (f0 + f1) * 0.5;
+            let color = [
+                lerp(0.05, 0.55, mid),
+                lerp(0.75, 0.38, mid),
+                1.0,
+                alpha * (1.0 - (mid - 0.5).abs() * 0.45),
+            ];
+            self.line(
+                t,
+                left + glow_w * f0,
+                y,
+                left + glow_w * f1 + 0.5,
+                y,
+                2.2,
+                color,
+            );
+        }
+        self.line(
+            t,
+            left + glow_w * 0.12,
+            y - 2.0,
+            left + glow_w * 0.88,
+            y - 2.0,
+            4.5,
+            theme::fade(cfg.notch.accent, alpha * 0.06),
+        );
+    }
+
+    fn paint_standby_gif(&mut self, t: &ID2D1DCRenderTarget, shape: NotchShape, alpha: f32) {
+        let generation = self.solid_generation;
+        if self.standby_gif_failed_generation == Some(generation) {
+            return;
+        }
+        let stale = self
+            .standby_gif
+            .as_ref()
+            .is_none_or(|gif| gif.generation != generation);
+        if stale {
+            self.standby_gif = self.decode_standby_gif(t, generation);
+            if self.standby_gif.is_none() {
+                self.standby_gif_failed_generation = Some(generation);
+                return;
+            }
+            self.standby_gif_failed_generation = None;
+        }
+
+        let Some(gif) = &self.standby_gif else {
+            return;
+        };
+        if gif.frames.is_empty() || gif.total_ms == 0 {
+            return;
+        }
+        self.report(Motion::Ambient);
+        let at = (gif.started.elapsed().as_millis() as u64) % gif.total_ms;
+        let frame = gif
+            .frames
+            .iter()
+            .find(|frame| at < frame.until_ms)
+            .unwrap_or_else(|| gif.frames.last().expect("GIF has frames"));
+        let size = unsafe { frame.bitmap.GetSize() };
+        if size.width <= 0.0 || size.height <= 0.0 {
+            return;
+        }
+        let box_side = (shape.height() - 8.0).clamp(14.0, 26.0);
+        let scale = (box_side / size.width).min(box_side / size.height);
+        let (dw, dh) = (size.width * scale, size.height * scale);
+        let cx = shape.right - theme::PILL_GUTTER - box_side * 0.5;
+        let cy = (shape.top + shape.bottom) * 0.5;
+        let dst = D2D_RECT_F {
+            left: cx - dw * 0.5,
+            top: cy - dh * 0.5,
+            right: cx + dw * 0.5,
+            bottom: cy + dh * 0.5,
+        };
+        unsafe {
+            t.DrawBitmap(
+                &frame.bitmap,
+                Some(&dst),
+                alpha.clamp(0.0, 1.0),
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                None,
+            );
+        }
+    }
+
+    fn decode_standby_gif(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        generation: u64,
+    ) -> Option<CachedStandbyGif> {
+        let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(include_bytes!(
+            "../../assets/standby.gif"
+        )))
+        .ok()?;
+        let decoded = decoder.into_frames().collect_frames().ok()?;
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        let mut frames = Vec::with_capacity(decoded.len());
+        let mut total_ms = 0u64;
+        for frame in decoded {
+            let (numerator, denominator) = frame.delay().numer_denom_ms();
+            let delay_ms = if denominator == 0 {
+                100
+            } else {
+                ((numerator as f64 / denominator as f64).round() as u64).clamp(16, 2_000)
+            };
+            // The source mascot is 300px square but is drawn at at most 26px.
+            // Uploading full-size copies of all 18 frames would waste several
+            // megabytes of GPU memory for no visible benefit.
+            let source = frame.into_buffer();
+            let rgba =
+                image::imageops::resize(&source, 64, 64, image::imageops::FilterType::Lanczos3);
+            let (width, height) = rgba.dimensions();
+            let mut bgra = rgba.into_raw();
+            for pixel in bgra.chunks_exact_mut(4) {
+                let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
+                pixel[0] = ((b as u16 * a as u16 + 127) / 255) as u8;
+                pixel[1] = ((g as u16 * a as u16 + 127) / 255) as u8;
+                pixel[2] = ((r as u16 * a as u16 + 127) / 255) as u8;
+                pixel[3] = a;
+            }
+            let bitmap = unsafe {
+                t.CreateBitmap(
+                    windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U { width, height },
+                    Some(bgra.as_ptr() as *const std::ffi::c_void),
+                    width * 4,
+                    &props,
+                )
+                .ok()?
+            };
+            total_ms = total_ms.saturating_add(delay_ms);
+            frames.push(StandbyGifFrame {
+                bitmap,
+                until_ms: total_ms,
+            });
+        }
+        (!frames.is_empty()).then_some(CachedStandbyGif {
+            generation,
+            frames,
+            total_ms,
+            started: Instant::now(),
+        })
+    }
+
     fn paint_clock(
         &mut self,
         t: &ID2D1DCRenderTarget,
@@ -3702,7 +4171,13 @@ impl Painter {
     ) {
         let family = &cfg.notch.font_family;
         let clock = Clock::now();
+        if cfg.notch.prayer.enabled && cfg.notch.prayer.show_on_clock {
+            self.paint_prayer_dashboard(t, cfg, &clock, body, alpha);
+            return;
+        }
         let time = clock.time_string(cfg.notch.clock_24h);
+        let clock_bottom = body.bottom;
+        let clock_height = (clock_bottom - body.top).max(theme::SIZE_CLOCK + 4.0);
 
         // --- oversized time -------------------------------------------------
         let mut time_w = 0.0;
@@ -3712,9 +4187,9 @@ impl Painter {
             theme::SIZE_CLOCK,
             DWRITE_FONT_WEIGHT_EXTRA_BOLD,
         ) {
-            if let Ok(layout) =
-                self.text
-                    .layout(&time, &fmt, body.right - body.left, body.bottom - body.top)
+            if let Ok(layout) = self
+                .text
+                .layout(&time, &fmt, body.right - body.left, clock_height)
             {
                 let (w, h) = TextEngine::measure(&layout);
                 time_w = w;
@@ -3725,13 +4200,13 @@ impl Painter {
                     t,
                     &layout,
                     body.left,
-                    body.top + (body.bottom - body.top - h) * 0.5 - 8.0,
+                    body.top + (clock_height - h) * 0.5 - 3.0,
                     theme::fade(self.pal.text_hi, alpha),
                 );
             }
         }
 
-        let time_top = body.top + (body.bottom - body.top - time_h) * 0.5 - 8.0;
+        let time_top = body.top + (clock_height - time_h) * 0.5 - 3.0;
 
         if !cfg.notch.clock_24h {
             self.label(
@@ -3811,6 +4286,320 @@ impl Painter {
             bar_y + 10.0,
             theme::fade(self.pal.text_lo, alpha * 0.9),
         );
+    }
+
+    /// Responsive Prayer dashboard: next prayer and countdown on one side,
+    /// today's curved schedule on the other (or below on narrow panels).
+    fn paint_prayer_dashboard(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        clock: &Clock,
+        body: D2D_RECT_F,
+        alpha: f32,
+    ) {
+        let family = &cfg.notch.font_family;
+        let prayers = crate::notch::prayer::today_schedule(&cfg.notch.prayer);
+        let now = (clock.hour24 * 60 + clock.minute) as i32;
+        let next_index = prayers
+            .iter()
+            .position(|prayer| prayer.minute >= now)
+            .unwrap_or(0);
+        let next = prayers[next_index];
+        let remaining = if next.minute >= now {
+            next.minute - now
+        } else {
+            24 * 60 - now + next.minute
+        };
+
+        let width = body.right - body.left;
+        let height = body.bottom - body.top;
+        let header_h = 25.0;
+        let content_top = body.top + header_h;
+        let wide = width >= 430.0 && height >= 118.0;
+        let (summary, chart) = if wide {
+            let split = body.left + width * 0.39;
+            (
+                D2D_RECT_F {
+                    left: body.left,
+                    top: content_top,
+                    right: split - 14.0,
+                    bottom: body.bottom,
+                },
+                D2D_RECT_F {
+                    left: split + 8.0,
+                    top: content_top,
+                    right: body.right,
+                    bottom: body.bottom,
+                },
+            )
+        } else {
+            let split = content_top + (height - header_h) * 0.48;
+            (
+                D2D_RECT_F {
+                    left: body.left,
+                    top: content_top,
+                    right: body.right,
+                    bottom: split - 4.0,
+                },
+                D2D_RECT_F {
+                    left: body.left,
+                    top: split + 4.0,
+                    right: body.right,
+                    bottom: body.bottom,
+                },
+            )
+        };
+
+        // Header follows the reference: product, location, date and live time.
+        self.label(
+            t,
+            family,
+            "Prayer",
+            16.0,
+            DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+            0.0,
+            74.0,
+            body.left,
+            body.top,
+            theme::fade(self.pal.text_hi, alpha),
+        );
+        let location = cfg.notch.prayer.location_name.trim();
+        let date_x = body.left + width * 0.35;
+        let location_x = body.left + 82.0;
+        self.label(
+            t,
+            family,
+            if location.is_empty() {
+                "Local"
+            } else {
+                location
+            },
+            10.5,
+            DWRITE_FONT_WEIGHT_MEDIUM,
+            0.0,
+            if wide {
+                (date_x - location_x - 8.0).max(40.0)
+            } else {
+                (body.right - 58.0 - (body.left + 82.0)).max(34.0)
+            },
+            location_x,
+            body.top + 4.0,
+            theme::fade(self.pal.text_lo, alpha),
+        );
+        let weekday =
+            ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][(clock.weekday as usize).min(6)];
+        let month = &MONTHS[((clock.month as usize).max(1) - 1).min(11)][..3];
+        let date = format!("{weekday} {} {month} {}", clock.day, clock.year);
+        if wide {
+            self.label(
+                t,
+                family,
+                &date,
+                12.0,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                0.0,
+                125.0,
+                date_x,
+                body.top + 2.0,
+                theme::fade(self.pal.text_hi, alpha),
+            );
+        }
+        self.label(
+            t,
+            crate::fonts::GEIST_MONO,
+            &clock.time_string(true),
+            13.0,
+            DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+            0.0,
+            48.0,
+            body.right - 48.0,
+            body.top + 1.0,
+            theme::fade(self.pal.text_hi, alpha),
+        );
+
+        // Next prayer summary.
+        self.label(
+            t,
+            family,
+            "Next",
+            10.0,
+            DWRITE_FONT_WEIGHT_MEDIUM,
+            0.0,
+            summary.right - summary.left,
+            summary.left,
+            summary.top,
+            theme::fade(self.pal.text_lo, alpha),
+        );
+        let name_size = if wide { 30.0 } else { 24.0 };
+        self.label(
+            t,
+            family,
+            next.name,
+            name_size,
+            DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+            0.0,
+            summary.right - summary.left,
+            summary.left,
+            summary.top + 12.0,
+            theme::fade(self.pal.text_hi, alpha),
+        );
+        let detail_y = summary.top + if wide { 50.0 } else { 42.0 };
+        self.label(
+            t,
+            crate::fonts::GEIST_MONO,
+            &format!("{:02}:{:02}", next.minute / 60, next.minute % 60),
+            14.0,
+            DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+            0.0,
+            54.0,
+            summary.left,
+            detail_y,
+            theme::fade(self.pal.text_hi, alpha),
+        );
+        self.label(
+            t,
+            family,
+            &format!("in {}", span_text(remaining as i64)),
+            12.0,
+            DWRITE_FONT_WEIGHT_BOLD,
+            0.0,
+            (summary.right - summary.left - 58.0).max(40.0),
+            summary.left + 60.0,
+            detail_y + 1.0,
+            theme::fade(cfg.notch.accent, alpha),
+        );
+
+        let (previous_minute, next_minute) = if next_index == 0 && next.minute < now {
+            (prayers[4].minute, next.minute + 24 * 60)
+        } else if next_index == 0 {
+            (prayers[4].minute - 24 * 60, next.minute)
+        } else {
+            (prayers[next_index - 1].minute, next.minute)
+        };
+        let phase = ((now - previous_minute) as f32
+            / (next_minute - previous_minute).max(1) as f32)
+            .clamp(0.0, 1.0);
+        let bar_y = summary.bottom - 8.0;
+        let bar_w = (summary.right - summary.left).min(168.0);
+        self.fill_rrect(
+            t,
+            D2D_RECT_F {
+                left: summary.left,
+                top: bar_y,
+                right: summary.left + bar_w,
+                bottom: bar_y + 5.0,
+            },
+            2.5,
+            theme::fade(self.pal.well, alpha * 2.0),
+        );
+        self.fill_rrect(
+            t,
+            D2D_RECT_F {
+                left: summary.left,
+                top: bar_y,
+                right: summary.left + bar_w * phase,
+                bottom: bar_y + 5.0,
+            },
+            2.5,
+            theme::fade(cfg.notch.accent, alpha),
+        );
+
+        // Curved daily schedule.
+        let graph_left = chart.left + 8.0;
+        let graph_right = chart.right - 8.0;
+        let graph_bottom = chart.bottom - 30.0;
+        let curve_h = ((chart.bottom - chart.top) * 0.47).clamp(16.0, 48.0);
+        let graph_progress = if now <= prayers[0].minute {
+            0.0
+        } else if now >= prayers[4].minute {
+            1.0
+        } else {
+            let slot = prayers
+                .windows(2)
+                .position(|pair| now >= pair[0].minute && now < pair[1].minute)
+                .unwrap_or(0);
+            let from = prayers[slot].minute;
+            let to = prayers[slot + 1].minute;
+            (slot as f32 + (now - from) as f32 / (to - from).max(1) as f32) / 4.0
+        };
+        let point = |f: f32| {
+            (
+                graph_left + (graph_right - graph_left) * f,
+                graph_bottom - (std::f32::consts::PI * f).sin() * curve_h,
+            )
+        };
+        let mut previous = point(0.0);
+        for step in 1..=40 {
+            let f = step as f32 / 40.0;
+            let current = point(f);
+            let tone = if f <= graph_progress + 0.015 {
+                [0.02, 0.58, 1.0, 1.0]
+            } else {
+                self.pal.rule
+            };
+            self.line(
+                t,
+                previous.0,
+                previous.1,
+                current.0,
+                current.1,
+                2.3,
+                theme::fade(tone, alpha),
+            );
+            previous = current;
+        }
+
+        let label_w = ((graph_right - graph_left) / 4.0).max(34.0);
+        for (index, prayer) in prayers.iter().enumerate() {
+            let fraction = index as f32 / 4.0;
+            let (x, y) = point(fraction);
+            let current = next_index == index;
+            if current {
+                self.dot(t, x, y, 12.0, theme::fade(cfg.notch.accent, alpha * 0.06));
+                self.dot(t, x, y, 7.0, theme::fade(cfg.notch.accent, alpha * 0.17));
+                self.dot(t, x, y, 4.0, theme::fade([1.0, 0.95, 0.76, 1.0], alpha));
+            } else {
+                self.dot(t, x, y, 2.5, theme::fade(self.pal.text_hi, alpha * 0.85));
+            }
+            let area = D2D_RECT_F {
+                left: x - label_w * 0.5,
+                top: graph_bottom + 5.0,
+                right: x + label_w * 0.5,
+                bottom: chart.bottom,
+            };
+            self.centred_label(
+                t,
+                family,
+                prayer.name,
+                8.0,
+                if current {
+                    DWRITE_FONT_WEIGHT_EXTRA_BOLD
+                } else {
+                    DWRITE_FONT_WEIGHT_SEMI_BOLD
+                },
+                area,
+                area.top,
+                theme::fade(
+                    if current {
+                        self.pal.text_hi
+                    } else {
+                        self.pal.text_lo
+                    },
+                    alpha,
+                ),
+            );
+            self.centred_label(
+                t,
+                crate::fonts::GEIST_MONO,
+                &format!("{:02}:{:02}", prayer.minute / 60, prayer.minute % 60),
+                7.5,
+                DWRITE_FONT_WEIGHT_MEDIUM,
+                area,
+                area.top + 10.0,
+                theme::fade(self.pal.text_lo, alpha * 0.85),
+            );
+        }
     }
 
     fn paint_marquee(
@@ -4182,22 +4971,22 @@ impl Painter {
         &self,
         t: &ID2D1DCRenderTarget,
         factory: &windows::Win32::Graphics::Direct2D::ID2D1Factory,
-        cfg: &AppConfig,
         body: D2D_RECT_F,
         playing: bool,
         alpha: f32,
+        accent: Rgba,
     ) {
         let [prev, toggle, next] = crate::notch::geom::media_transport_buttons(body);
 
         for (cx, cy, r) in [prev, toggle, next] {
-            self.dot(t, cx, cy, r, theme::fade(self.pal.well, alpha * 1.6));
+            self.dot(t, cx, cy, r, theme::fade(accent, alpha * 0.16));
         }
 
-        let dim = theme::fade(self.pal.text_hi, alpha * 0.82);
+        let dim = theme::fade(accent, alpha * 0.88);
         self.skip_icon(t, factory, prev, dim, true);
         self.skip_icon(t, factory, next, dim, false);
 
-        let accent = theme::fade(cfg.notch.accent, alpha);
+        let accent = theme::fade(accent, alpha);
         if playing {
             self.pause_icon(t, toggle, accent);
         } else {
@@ -4325,6 +5114,7 @@ impl Painter {
         radius: f32,
         alpha: f32,
         generation: u64,
+        rotation_degrees: f32,
     ) -> bool {
         let Some(bytes) = &now.art else {
             return false;
@@ -4387,7 +5177,10 @@ impl Painter {
             };
 
         unsafe {
-            brush.SetTransform(&(scale_matrix(scale) * Matrix3x2::translation(ox, oy)));
+            let base = scale_matrix(scale) * Matrix3x2::translation(ox, oy);
+            let cx = (art.left + art.right) * 0.5;
+            let cy = (art.top + art.bottom) * 0.5;
+            brush.SetTransform(&(base * Matrix3x2::rotation(rotation_degrees, cx, cy)));
             brush.SetOpacity(alpha);
         }
 

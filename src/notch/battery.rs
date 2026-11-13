@@ -19,9 +19,9 @@ const POLL: Duration = Duration::from_secs(4);
 const NO_BATTERY: u8 = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Reading {
-    on_ac: bool,
-    pct: u8,
+pub struct Reading {
+    pub on_ac: bool,
+    pub pct: u8,
 }
 
 struct Watch {
@@ -50,6 +50,12 @@ fn read() -> Option<Reading> {
     })
 }
 
+/// Current battery state for compact UI surfaces. This is one inexpensive
+/// Windows power-status read and returns `None` on desktops without a battery.
+pub fn current() -> Option<Reading> {
+    read()
+}
+
 /// What to say about the change from `before` to `now`, if anything.
 fn alert(
     cfg: &BatteryAlertConfig,
@@ -61,6 +67,13 @@ fn alert(
         *warned_at = None;
     }
     if let Some(before) = before {
+        if now.on_ac && now.pct >= 100 && before.pct < 100 {
+            return Some((
+                "Fully charged".to_owned(),
+                "Battery reached 100%.".to_owned(),
+                NotificationLevel::Success,
+            ));
+        }
         if before.on_ac != now.on_ac {
             return Some(if now.on_ac {
                 (
@@ -134,6 +147,14 @@ mod tests {
         assert!(alert(&cfg, Some(r(false, 50)), r(true, 50), &mut w).is_some());
         assert!(alert(&cfg, Some(r(true, 50)), r(false, 50), &mut w).is_some());
         assert!(alert(&cfg, Some(r(false, 50)), r(false, 49), &mut w).is_none());
+    }
+
+    #[test]
+    fn reaching_full_charge_is_announced() {
+        let cfg = BatteryAlertConfig::default();
+        let mut w = None;
+        let said = alert(&cfg, Some(r(true, 99)), r(true, 100), &mut w).unwrap();
+        assert_eq!(said.0, "Fully charged");
     }
 
     #[test]

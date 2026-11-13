@@ -504,26 +504,8 @@ pub struct UsageSnapshot {
     pub updated_at_secs: u64,
 }
 
-/// JSON payload received over the local `/usage` Webhook endpoint.
-#[derive(Debug, Deserialize)]
-pub struct UsagePayload {
-    pub context_used_pct: Option<f32>,
-    pub cost_usd: Option<f64>,
-    pub rate_5h_pct: Option<f32>,
-    pub rate_5h_resets_at: Option<String>,
-    pub rate_7d_pct: Option<f32>,
-    pub rate_7d_resets_at: Option<String>,
-}
-
 static USAGE_STORE: parking_lot::RwLock<Option<Arc<RwLock<UsageSnapshot>>>> =
     parking_lot::RwLock::new(None);
-
-/// Bumped on every `/usage` post, so the notch repaints when one lands.
-static USAGE_REVISION: AtomicU64 = AtomicU64::new(0);
-
-pub fn usage_revision() -> u64 {
-    USAGE_REVISION.load(Ordering::Acquire)
-}
 
 pub fn usage_store() -> Arc<RwLock<UsageSnapshot>> {
     let read = USAGE_STORE.read();
@@ -664,7 +646,7 @@ fn handle_webhook_client(
     }
 
     if first_line.starts_with("GET") {
-        let body = r#"{"status":"running","service":"Venu Dynamic Notch"}"#;
+        let body = r#"{"status":"running","service":"Nova Dynamic Notch"}"#;
         let resp = format!(
             "HTTP/1.1 200 OK\r\n\
              Access-Control-Allow-Origin: *\r\n\
@@ -716,36 +698,6 @@ fn handle_webhook_client(
                         let _ = stream.write_all(resp.as_bytes());
                         return;
                     }
-                }
-            } else if path == "/usage" {
-                if let Ok(payload) = serde_json::from_str::<UsagePayload>(body_str.trim()) {
-                    let epoch = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let store = usage_store();
-                    *store.write() = UsageSnapshot {
-                        context_used_pct: payload.context_used_pct,
-                        cost_usd: payload.cost_usd,
-                        rate_5h_pct: payload.rate_5h_pct,
-                        rate_5h_resets_at: payload.rate_5h_resets_at,
-                        rate_7d_pct: payload.rate_7d_pct,
-                        rate_7d_resets_at: payload.rate_7d_resets_at,
-                        updated_at_secs: epoch,
-                    };
-                    USAGE_REVISION.fetch_add(1, Ordering::AcqRel);
-
-                    let resp_body = r#"{"status":"ok","delivered":true}"#;
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\n\
-                         Access-Control-Allow-Origin: *\r\n\
-                         Content-Type: application/json\r\n\
-                         Content-Length: {}\r\n\r\n{}",
-                        resp_body.len(),
-                        resp_body
-                    );
-                    let _ = stream.write_all(resp.as_bytes());
-                    return;
                 }
             } else if let Ok(payload) = serde_json::from_str::<WebhookPayload>(body_str.trim()) {
                 let app = payload.app.unwrap_or_else(|| "System".to_string());

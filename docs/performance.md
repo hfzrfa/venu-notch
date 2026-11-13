@@ -1,5 +1,46 @@
 # CPU investigation
 
+## RAM target and measurement
+
+Nova's release build is kept below a 150 MB private working-set target in its
+normal background state and while Settings is open. Private working set is the
+closest programmatic counter to the per-process **Memory** value shown by Task
+Manager. Total working set is also reported during profiling, but includes
+shared Windows, OpenGL and GPU-driver pages that are not private to Nova.
+
+The Settings GUI now avoids two permanent duplicates:
+
+- eframe is built only with the Windows-relevant Glow renderer and
+  accessibility support, without its unused default font and WGPU dependency
+  trees;
+- egui no longer reads and parses the complete 12.9 MB Segoe UI Emoji font or
+  the legacy Plus Jakarta Sans UI face. The native notch still uses DirectWrite
+  and therefore retains Windows system-font fallback for lyrics, notifications
+  and user content.
+
+Measured on the Windows development machine on 2026-10-30 using an optimized
+release build and the current saved configuration:
+
+| State | Private working set | Private commit | Total working set |
+|:---|---:|---:|---:|
+| Tray/notch idle, 20-second sample | 75.2–84.7 MB | 89.5–101.7 MB | 123.9–134.7 MB |
+| Settings open and settled | 108.5 MB | 133.6 MB | 182.2 MB |
+
+The Settings total includes shared graphics-driver pages; its private working
+set and private commit remain below the 150 MB target. Results vary by GPU
+driver, Windows version, enabled slides, artwork and wallpaper size, so the
+repository includes a repeatable check rather than treating one machine's
+number as universal:
+
+```powershell
+cargo build --release --locked
+.\target\release\nova.exe --startup
+.\scripts\measure-memory.ps1 -DurationSeconds 30 -LimitMB 150
+```
+
+Open Settings and run the last command again to measure the GUI state. Fully
+exit Nova from its tray menu before switching binaries.
+
 The performance change in PR #1 is present in main and v0.4.1. It gates notch
 repaints, but three paths still cause unnecessary work:
 
@@ -60,7 +101,7 @@ measured here; no CPU percentage improvement is claimed.
 
 ## Measure on Windows
 
-Build main and this branch with `cargo build --release --locked`. Fully exit Venu
+Build main and this branch with `cargo build --release --locked`. Fully exit Nova
 using its tray menu before switching binaries; closing Settings only hides it,
 and the single-instance mutex otherwise leaves the old executable running.
 Keep the same saved configuration and use the same machine for both builds.
@@ -79,21 +120,21 @@ This PowerShell sample reports average CPU over 30 seconds, normalized across
 logical processors like Task Manager:
 
 ```powershell
-$venuProcess = @(Get-Process -Name venu -ErrorAction Stop)
-if ($venuProcess.Count -ne 1) { throw "Expected exactly one Venu process" }
-$venuProcess = $venuProcess[0]
+$novaProcess = @(Get-Process -Name nova -ErrorAction Stop)
+if ($novaProcess.Count -ne 1) { throw "Expected exactly one Nova process" }
+$novaProcess = $novaProcess[0]
 $logicalProcessors = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
-$cpuStart = $venuProcess.TotalProcessorTime.TotalSeconds
+$cpuStart = $novaProcess.TotalProcessorTime.TotalSeconds
 $timer = [Diagnostics.Stopwatch]::StartNew()
 Start-Sleep -Seconds 30
-$venuProcess.Refresh()
+$novaProcess.Refresh()
 $elapsed = $timer.Elapsed.TotalSeconds
-$cpuDelta = $venuProcess.TotalProcessorTime.TotalSeconds - $cpuStart
+$cpuDelta = $novaProcess.TotalProcessorTime.TotalSeconds - $cpuStart
 "Average CPU: {0:N2}%" -f (100 * $cpuDelta / $elapsed / $logicalProcessors)
 ```
 
 Repeat each sample three times. If CPU remains high, record a CPU Usage sampling
-trace with Windows Performance Recorder and inspect Venu's stacks in Windows
+trace with Windows Performance Recorder and inspect Nova's stacks in Windows
 Performance Analyzer. In particular, distinguish the overlay thread's
 DirectWrite/GDI/Direct2D work from the Settings thread's egui/OpenGL work and
 the media poller's WinRT calls before choosing the next optimization.

@@ -21,7 +21,7 @@ use windows::Win32::System::Threading::GetSystemTimes;
 
 pub(crate) use crate::stats_math::format_bytes;
 use crate::stats_math::{
-    busiest_gpu_engine, cpu_utilization, normalize_power, power_hint, power_value, CpuTimes,
+    busiest_gpu_engine, cpu_utilization, normalize_power, power_value, CpuTimes,
 };
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
@@ -59,15 +59,6 @@ impl StatsSnapshot {
             self.battery_present,
         )
     }
-
-    pub fn power_hint(&self) -> &'static str {
-        power_hint(
-            self.battery_present,
-            self.battery_pct,
-            self.ac_online,
-            self.charging,
-        )
-    }
 }
 
 #[derive(Default)]
@@ -85,7 +76,7 @@ impl StatsService {
         let shared = Arc::new((Mutex::new(SharedState::default()), Condvar::new()));
         let worker_state = Arc::clone(&shared);
         if let Err(error) = std::thread::Builder::new()
-            .name("venu-stats".to_string())
+            .name("nova-stats".to_string())
             .spawn(move || sample_worker(worker_state))
         {
             eprintln!("[stats] could not start sampling worker: {error}");

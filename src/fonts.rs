@@ -1,4 +1,4 @@
-//! Fonts shipped privately with Venu.
+//! Fonts shipped privately with Nova.
 //!
 //! The embedded DirectWrite collection keeps Geist available without
 //! installing anything in Windows. System fallback remains active for scripts

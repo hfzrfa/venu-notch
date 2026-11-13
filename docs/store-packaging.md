@@ -1,14 +1,14 @@
 # Microsoft Store (MSIX) packaging
 
-The Store build is the same `venu.exe`. Two features only work there, because
+The Store build is the same `nova.exe`. Two features only work there, because
 Windows gives them to packaged apps only, and both need entries in the
 package's `AppxManifest.xml`.
 
 ## Launch on startup
 
 Packaged apps start with Windows through a startup task, not the registry Run
-key the portable build uses. Venu looks the task up by id, so the `TaskId`
-must be exactly `VenuStartup` (`autostart::STORE_TASK_ID`).
+key the portable build uses. Nova looks the task up by id, so the `TaskId`
+must be exactly `NovaStartup` (`autostart::STORE_TASK_ID`).
 
 ```xml
 <Package
@@ -20,11 +20,11 @@ must be exactly `VenuStartup` (`autostart::STORE_TASK_ID`).
   IgnorableNamespaces="uap uap3 desktop rescap">
   ...
   <Applications>
-    <Application Id="Venu" Executable="venu.exe" EntryPoint="Windows.FullTrustApplication">
+    <Application Id="Nova" Executable="nova.exe" EntryPoint="Windows.FullTrustApplication">
       ...
       <Extensions>
         <desktop:Extension Category="windows.startupTask">
-          <desktop:StartupTask TaskId="VenuStartup" Enabled="false" DisplayName="Venu" />
+          <desktop:StartupTask TaskId="NovaStartup" Enabled="false" DisplayName="Nova" />
         </desktop:Extension>
       </Extensions>
     </Application>
@@ -32,9 +32,9 @@ must be exactly `VenuStartup` (`autostart::STORE_TASK_ID`).
 ```
 
 - `Enabled="false"`: the Store build starts with this off. Turning it on in
-  Venu's Settings asks Windows (`StartupTask.RequestEnableAsync`).
-- If the user turns Venu off in **Settings › Apps › Startup**, Windows reports
-  `DisabledByUser`; Venu shows that and never re-enables itself.
+  Nova's Settings asks Windows (`StartupTask.RequestEnableAsync`).
+- If the user turns Nova off in **Settings › Apps › Startup**, Windows reports
+  `DisabledByUser`; Nova shows that and never re-enables itself.
 - A startup-task launch passes no arguments. That is fine: an ordinary launch
   already starts quietly in the tray.
 
